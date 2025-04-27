@@ -1,0 +1,1679 @@
+import os
+import base64
+import re
+import json
+import datetime
+import uuid
+import io
+import sqlite3
+from typing import List, Optional, Union
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from openai import AzureOpenAI
+from dotenv import load_dotenv
+import requests
+from PIL import Image
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Azure OpenAI client
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "https://jaggery-open-ai.openai.azure.com/")
+DEPLOYMENT_NAME = os.getenv("DEPLOYMENT_NAME", "gpt-4o")
+
+client = AzureOpenAI(
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_key=AZURE_OPENAI_KEY,
+    api_version="2024-05-01-preview",
+)
+
+# Create directories for uploads and static files
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+GENERATED_IMAGES_DIR = os.path.join(os.getcwd(), "generated_images")
+STATIC_DIR = os.path.join(os.getcwd(), "static")
+DB_DIR = os.path.join(os.getcwd(), "db")
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(GENERATED_IMAGES_DIR, exist_ok=True)
+os.makedirs(STATIC_DIR, exist_ok=True)
+os.makedirs(DB_DIR, exist_ok=True)
+
+# Set up the database
+DB_PATH = os.path.join(DB_DIR, "adtao.db")
+
+def get_db_connection():
+    """Create a connection to the SQLite database"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    """Initialize the database schema"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Create images table
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS images (
+            id TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            revised_prompt TEXT,
+            file_path TEXT NOT NULL,
+            static_path TEXT NOT NULL,
+            creation_date TEXT NOT NULL,
+            width INTEGER,
+            height INTEGER,
+            size TEXT,
+            model TEXT NOT NULL
+        )
+        ''')
+        
+        # Create ad_copies table
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS ad_copies (
+            id TEXT PRIMARY KEY,
+            product_name TEXT NOT NULL,
+            target_audience TEXT NOT NULL,
+            headline TEXT NOT NULL,
+            primary_text TEXT NOT NULL,
+            description TEXT NOT NULL,
+            creation_date TEXT NOT NULL
+        )
+        ''')
+        
+        # Create integrated_ads table
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS integrated_ads (
+            id TEXT PRIMARY KEY,
+            ad_copy_id TEXT,
+            image_id TEXT,
+            product_name TEXT NOT NULL,
+            target_audience TEXT NOT NULL,
+            creation_date TEXT NOT NULL,
+            FOREIGN KEY (ad_copy_id) REFERENCES ad_copies (id),
+            FOREIGN KEY (image_id) REFERENCES images (id)
+        )
+        ''')
+        
+        # Create brand_profiles table
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS brand_profiles (
+            id TEXT PRIMARY KEY,
+            brand_name TEXT NOT NULL,
+            industry TEXT,
+            description TEXT NOT NULL,
+            tone_of_voice TEXT NOT NULL,
+            brand_values TEXT NOT NULL,
+            target_audience TEXT NOT NULL,
+            visual_identity TEXT NOT NULL,
+            color_palette TEXT,
+            do_guidelines TEXT,
+            dont_guidelines TEXT,
+            slogan TEXT,
+            hashtags TEXT,
+            examples TEXT,
+            creation_date TEXT NOT NULL,
+            last_updated TEXT NOT NULL
+        )
+        ''')
+        
+        conn.commit()
+        print("Database initialized successfully")
+        
+    except sqlite3.Error as e:
+        print(f"SQLite error during database initialization: {e}")
+        if conn:
+            conn.rollback()
+    except Exception as e:
+        print(f"Unexpected error during database initialization: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
+# Initialize the database
+init_db()
+
+# Create FastAPI app
+app = FastAPI(
+    title="Facebook Ad Generator API",
+    description="An API for generating Facebook Ad content, including ad copy and images, with brand profile integration.",
+    version="1.0.0",
+    openapi_tags=[
+        {
+            "name": "General",
+            "description": "General API information and health checks"
+        },
+        {
+            "name": "Ad Copy",
+            "description": "Endpoints for generating text content for Facebook ads"
+        },
+        {
+            "name": "Images",
+            "description": "Endpoints for generating, analyzing, and managing images for ads"
+        },
+        {
+            "name": "Integrated Ads",
+            "description": "Endpoints for creating complete ads with both copy and images"
+        },
+        {
+            "name": "Brand Profiles",
+            "description": "Endpoints for managing brand guidelines and profiles"
+        },
+        {
+            "name": "Database",
+            "description": "Endpoints for accessing stored content and statistics"
+        }
+    ],
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with specific origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount static files directory for serving uploaded images
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Define request and response models
+
+# Ad Copy Models
+class AdCopyRequest(BaseModel):
+    product_name: str
+    target_audience: str
+    key_benefits: List[str]
+    tone: Optional[str] = "professional"
+    ad_length: Optional[str] = "medium"
+
+class AdCopyResponse(BaseModel):
+    headline: str
+    primary_text: str
+    description: str
+
+# Image Models
+class ImageAnalysisRequest(BaseModel):
+    image_path: str = Field(..., description="Path to the image file to analyze")
+    product_name: str = Field(..., description="Name of the product in the image")
+    target_audience: Optional[str] = Field(None, description="Target audience for the ad")
+
+class ImageAnalysisResponse(BaseModel):
+    image_quality: str
+    composition_rating: str
+    audience_appeal: str
+    suggested_improvements: List[str]
+    compatibility_score: float = Field(..., ge=0.0, le=10.0, description="Score out of 10 for Facebook ad compatibility")
+
+class ImageCaptionRequest(BaseModel):
+    image_path: str
+    product_name: str
+    tone: Optional[str] = "professional"
+
+class ImageCaptionResponse(BaseModel):
+    short_caption: str = Field(..., description="Short caption for the image (max 125 characters)")
+    full_caption: str = Field(..., description="Longer, more detailed caption")
+    alt_text: str = Field(..., description="Accessibility alt text for the image")
+
+class ImageAdRequest(BaseModel):
+    product_name: str
+    target_audience: str
+    key_benefits: List[str]
+    tone: Optional[str] = "professional"
+    image_style: Optional[str] = "product photography"
+    color_scheme: Optional[str] = None
+
+class ImageAdResponse(BaseModel):
+    image_prompt: str
+    image_description: str
+    ad_text_recommendations: List[str]
+
+class ImageGenerationRequest(BaseModel):
+    prompt: str
+    size: str = "1024x1024"
+
+class ImageGenerationResponse(BaseModel):
+    image_path: str
+    revised_prompt: Optional[str] = None
+
+# Integrated Models
+class IntegratedAdRequest(BaseModel):
+    product_name: str
+    target_audience: str
+    key_benefits: List[str]
+    tone: str = "professional"
+    ad_length: str = "medium"
+    image_style: str = "product photography"
+    color_scheme: str = None
+    generate_image: bool = True
+
+class IntegratedAdResponse(BaseModel):
+    headline: str
+    primary_text: str
+    description: str
+    image_prompt: str
+    image_description: str
+    ad_text_recommendations: List[str]
+    image_path: Optional[str] = None
+
+# Add new Pydantic models for brand profiles
+class BrandProfileBase(BaseModel):
+    brand_name: str = Field(..., description="Name of the brand")
+    industry: Optional[str] = Field(None, description="Industry or sector the brand operates in")
+    description: str = Field(..., description="Brief description of the brand")
+    tone_of_voice: str = Field(..., description="Preferred tone of voice (e.g., professional, casual, humorous)")
+    values: List[str] = Field(..., description="Core brand values")
+    target_audience: str = Field(..., description="Description of the target audience")
+    visual_identity: str = Field(..., description="Description of visual identity")
+    color_palette: Optional[str] = Field(None, description="Preferred colors (comma separated)")
+    do_guidelines: Optional[List[str]] = Field(None, description="What content creators SHOULD do")
+    dont_guidelines: Optional[List[str]] = Field(None, description="What content creators SHOULD NOT do")
+    slogan: Optional[str] = Field(None, description="Brand slogan or tagline")
+    hashtags: Optional[List[str]] = Field(None, description="Preferred hashtags")
+    examples: Optional[str] = Field(None, description="Examples of good brand content")
+
+class BrandProfileCreate(BrandProfileBase):
+    pass
+
+class BrandProfileResponse(BrandProfileBase):
+    id: str
+    creation_date: str
+    last_updated: str
+
+class BrandProfileUpdate(BaseModel):
+    brand_name: Optional[str] = None
+    industry: Optional[str] = None
+    description: Optional[str] = None
+    tone_of_voice: Optional[str] = None
+    values: Optional[List[str]] = None
+    target_audience: Optional[str] = None
+    visual_identity: Optional[str] = None
+    color_palette: Optional[str] = None
+    do_guidelines: Optional[List[str]] = None
+    dont_guidelines: Optional[List[str]] = None
+    slogan: Optional[str] = None
+    hashtags: Optional[List[str]] = None
+    examples: Optional[str] = None
+
+# Extended request models to include brand integration
+class AdCopyRequestWithBrand(AdCopyRequest):
+    brand_profile_id: Optional[str] = None
+
+class ImageAdRequestWithBrand(ImageAdRequest):
+    brand_profile_id: Optional[str] = None
+
+class IntegratedAdRequestWithBrand(IntegratedAdRequest):
+    brand_profile_id: Optional[str] = None
+
+# Helper functions for image processing
+def save_uploaded_image(image: UploadFile) -> str:
+    """Save an uploaded image and return the file path"""
+    # Generate a unique filename
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_id = str(uuid.uuid4())[:8]
+    filename = f"{timestamp}_{unique_id}_{image.filename}"
+    
+    # Create full path
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    
+    # Save the file
+    try:
+        # Use a safe method to save the file
+        contents = image.file.read()
+        
+        with open(file_path, "wb") as f:
+            f.write(contents)
+            
+        # Reset the file cursor in case it needs to be read again
+        image.file.seek(0)
+        
+        return file_path
+    except Exception as e:
+        print(f"Error saving uploaded image: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save image: {str(e)}")
+
+def analyze_image_content(image_path: str) -> dict:
+    """Analyze image content with Azure OpenAI vision capabilities"""
+    try:
+        # Encode the image
+        with open(image_path, "rb") as image_file:
+            encoded_image = base64.b64encode(image_file.read()).decode('ascii')
+        
+        # Create Azure OpenAI request with the image
+        chat_prompt = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "You are an expert in visual marketing and Facebook ad imagery. Analyze this image and provide detailed feedback on its effectiveness for Facebook advertising."
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Please analyze this image for use in Facebook advertising. Focus on visual appeal, composition, color usage, and how well it would perform in a Facebook ad."
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{encoded_image}"
+                        }
+                    }
+                ]
+            }
+        ]
+        
+        # Call Azure OpenAI
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=chat_prompt,
+            max_tokens=800,
+            temperature=0.7
+        )
+        
+        # Process and return the analysis
+        analysis_text = response.choices[0].message.content
+        
+        # For demo purposes, return a structured analysis
+        # In production, you'd want to parse the analysis_text into a structured format
+        return {
+            "raw_analysis": analysis_text,
+            "image_path": image_path
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image analysis failed: {str(e)}")
+
+def generate_image_captions(image_path: str, product_name: str, tone: str = "professional") -> dict:
+    """Generate captions for the provided image"""
+    try:
+        # Encode the image
+        with open(image_path, "rb") as image_file:
+            encoded_image = base64.b64encode(image_file.read()).decode('ascii')
+        
+        # Create Azure OpenAI request with the image
+        chat_prompt = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"You are a marketing expert specialized in creating compelling captions for product images. You excel at crafting captions that highlight product benefits and appeal to potential customers. Use a {tone} tone."
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Generate three captions for this image of {product_name}:\n1. A short caption (max 125 characters)\n2. A detailed caption explaining key benefits\n3. Accessibility alt text that describes the image"
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{encoded_image}"
+                        }
+                    }
+                ]
+            }
+        ]
+        
+        # Call Azure OpenAI
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=chat_prompt,
+            max_tokens=800,
+            temperature=0.7
+        )
+        
+        # Return the captions
+        return {
+            "response": response.choices[0].message.content,
+            "image_path": image_path
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Caption generation failed: {str(e)}")
+
+def generate_image_ad_recommendations(request: ImageAdRequest) -> ImageAdResponse:
+    """Generate image recommendations for a Facebook ad based on product details"""
+    
+    # Format benefits for the prompt
+    benefits = "\n".join([f"- {benefit}" for benefit in request.key_benefits])
+    
+    # Create the chat prompt
+    chat_prompt = [
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "You are an expert in visual marketing and ad imagery. You specialize in creating specific, detailed image recommendations for Facebook ads that drive engagement and conversions."
+                }
+            ]
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"""Create specific recommendations for Facebook ad imagery for:
+                    
+Product/Service: {request.product_name}
+Target Audience: {request.target_audience}
+Key Benefits:
+{benefits}
+Desired Tone: {request.tone}
+Preferred Image Style: {request.image_style}
+Color Scheme (if specified): {request.color_scheme or 'Not specified'}
+
+Please provide:
+1. A detailed image prompt that could be used for image generation
+2. A specific description of what the image should contain
+3. Three recommendations for ad text that would pair well with the imagery
+"""
+                }
+            ]
+        }
+    ]
+    
+    try:
+        # Generate completion
+        completion = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=chat_prompt,
+            max_tokens=1000,
+            temperature=0.7,
+            top_p=0.95
+        )
+        
+        # Extract the response
+        response_text = completion.choices[0].message.content
+        
+        # Parse the response (this is a simple example; you might want more robust parsing)
+        # For demonstration purposes, we'll extract sections based on numbering and headers
+        sections = response_text.split("\n\n")
+        
+        image_prompt = ""
+        image_description = ""
+        ad_text_recommendations = []
+        
+        for section in sections:
+            if "image prompt" in section.lower():
+                image_prompt = section.split(":", 1)[1].strip() if ":" in section else section
+            elif "description" in section.lower():
+                image_description = section.split(":", 1)[1].strip() if ":" in section else section
+            elif "recommendation" in section.lower() or "ad text" in section.lower():
+                # Extract numbered recommendations
+                lines = section.split("\n")
+                for line in lines:
+                    if any(line.strip().startswith(str(i)) for i in range(1, 4)):
+                        text = line.split(".", 1)[1].strip() if "." in line else line
+                        if text and len(text) > 5:  # Basic validation
+                            ad_text_recommendations.append(text)
+        
+        # If parsing fails, use placeholders
+        if not image_prompt:
+            image_prompt = "No specific image prompt generated"
+        if not image_description:
+            image_description = "No image description generated"
+        if not ad_text_recommendations:
+            ad_text_recommendations = ["No specific ad text recommendations generated"]
+        
+        return ImageAdResponse(
+            image_prompt=image_prompt,
+            image_description=image_description,
+            ad_text_recommendations=ad_text_recommendations
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate image recommendations: {str(e)}")
+
+def save_image_to_db(prompt: str, filename: str, file_path: str, static_path: str, revised_prompt: str = None, size: str = "1024x1024", model: str = "dall-e-3"):
+    """Save image metadata to the database"""
+    try:
+        # Get image dimensions
+        with Image.open(file_path) as img:
+            width, height = img.size
+        
+        # Create a unique ID
+        image_id = str(uuid.uuid4())
+        
+        # Get current date/time
+        creation_date = datetime.datetime.now().isoformat()
+        
+        # Insert into database
+        conn = get_db_connection()
+        conn.execute(
+            "INSERT INTO images (id, filename, prompt, revised_prompt, file_path, static_path, creation_date, width, height, size, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (image_id, filename, prompt, revised_prompt, file_path, static_path, creation_date, width, height, size, model)
+        )
+        conn.commit()
+        conn.close()
+        
+        return image_id
+    except Exception as e:
+        print(f"Error saving image to database: {str(e)}")
+        # Continue even if database save fails
+        return None
+
+def save_ad_copy_to_db(product_name: str, target_audience: str, headline: str, primary_text: str, description: str):
+    """Save ad copy to the database"""
+    try:
+        # Create a unique ID
+        ad_copy_id = str(uuid.uuid4())
+        
+        # Get current date/time
+        creation_date = datetime.datetime.now().isoformat()
+        
+        # Insert into database
+        conn = get_db_connection()
+        conn.execute(
+            "INSERT INTO ad_copies (id, product_name, target_audience, headline, primary_text, description, creation_date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ad_copy_id, product_name, target_audience, headline, primary_text, description, creation_date)
+        )
+        conn.commit()
+        conn.close()
+        
+        return ad_copy_id
+    except Exception as e:
+        print(f"Error saving ad copy to database: {str(e)}")
+        # Continue even if database save fails
+        return None
+
+def save_integrated_ad_to_db(product_name: str, target_audience: str, ad_copy_id: str = None, image_id: str = None):
+    """Save integrated ad to the database"""
+    try:
+        # Create a unique ID
+        integrated_ad_id = str(uuid.uuid4())
+        
+        # Get current date/time
+        creation_date = datetime.datetime.now().isoformat()
+        
+        # Insert into database
+        conn = get_db_connection()
+        conn.execute(
+            "INSERT INTO integrated_ads (id, ad_copy_id, image_id, product_name, target_audience, creation_date) VALUES (?, ?, ?, ?, ?, ?)",
+            (integrated_ad_id, ad_copy_id, image_id, product_name, target_audience, creation_date)
+        )
+        conn.commit()
+        conn.close()
+        
+        return integrated_ad_id
+    except Exception as e:
+        print(f"Error saving integrated ad to database: {str(e)}")
+        # Continue even if database save fails
+        return None
+
+def get_recent_images(limit: int = 10):
+    """Get recent images from the database"""
+    try:
+        conn = get_db_connection()
+        images = conn.execute(
+            "SELECT * FROM images ORDER BY creation_date DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        
+        # Convert to list of dictionaries
+        result = []
+        for img in images:
+            result.append(dict(img))
+        
+        return result
+    except Exception as e:
+        print(f"Error getting recent images: {str(e)}")
+        return []
+
+def get_image_by_id(image_id: str):
+    """Get image data by ID"""
+    try:
+        conn = get_db_connection()
+        image = conn.execute(
+            "SELECT * FROM images WHERE id = ?",
+            (image_id,)
+        ).fetchone()
+        conn.close()
+        
+        if image:
+            return dict(image)
+        return None
+    except Exception as e:
+        print(f"Error getting image by ID: {str(e)}")
+        return None
+
+def generate_image_from_prompt(prompt: str, size: str = "1024x1024") -> str:
+    """Generate an image using Azure OpenAI DALL-E and return the file path"""
+    try:
+        # Call DALL-E API
+        result = client.images.generate(
+            model="dall-e-3",
+            prompt=prompt,
+            n=1,
+            size=size
+        )
+        
+        # Get the image URL from the response
+        response_data = json.loads(result.model_dump_json())
+        image_url = response_data['data'][0]['url']
+        revised_prompt = response_data['data'][0].get('revised_prompt', None)
+        
+        # Download the image
+        image_response = requests.get(image_url)
+        
+        if image_response.status_code == 200:
+            # Generate a unique filename
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            unique_id = str(uuid.uuid4())[:8]
+            image_name = f"generated_{timestamp}_{unique_id}.png"
+            image_path = os.path.join(GENERATED_IMAGES_DIR, image_name)
+            
+            # Save the image
+            with open(image_path, "wb") as f:
+                f.write(image_response.content)
+                
+            # Make a copy in the static directory for serving via web
+            static_path = os.path.join(STATIC_DIR, image_name)
+            with open(static_path, "wb") as f:
+                f.write(image_response.content)
+            
+            # Save to database
+            image_id = save_image_to_db(
+                prompt=prompt,
+                filename=image_name,
+                file_path=image_path,
+                static_path=f"/static/{image_name}",
+                revised_prompt=revised_prompt,
+                size=size
+            )
+            
+            return {
+                "id": image_id,
+                "image_path": image_path,
+                "static_path": f"/static/{image_name}",
+                "revised_prompt": revised_prompt
+            }
+        else:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Failed to download image: {image_response.status_code}"
+            )
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Image generation failed: {str(e)}"
+        )
+
+# Brand profile database functions
+def create_brand_profile(profile: BrandProfileCreate) -> str:
+    """Create a new brand profile in the database"""
+    conn = None
+    try:
+        # Create a unique ID
+        profile_id = str(uuid.uuid4())
+        
+        # Get current date/time
+        now = datetime.datetime.now().isoformat()
+        
+        # Convert lists to JSON strings for storage with proper error handling
+        try:
+            # Use safe JSON serialization with default handling
+            values_json = json.dumps(profile.values if profile.values else [])
+            do_guidelines_json = json.dumps(profile.do_guidelines) if profile.do_guidelines else None
+            dont_guidelines_json = json.dumps(profile.dont_guidelines) if profile.dont_guidelines else None
+            hashtags_json = json.dumps(profile.hashtags) if profile.hashtags else None
+        except TypeError as e:
+            print(f"JSON serialization error: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Invalid data format: {str(e)}")
+        
+        # Insert into database
+        conn = get_db_connection()
+        conn.execute(
+            """INSERT INTO brand_profiles (
+                id, brand_name, industry, description, tone_of_voice, brand_values, 
+                target_audience, visual_identity, color_palette, do_guidelines, 
+                dont_guidelines, slogan, hashtags, examples, creation_date, last_updated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                profile_id, profile.brand_name, profile.industry, profile.description,
+                profile.tone_of_voice, values_json, profile.target_audience,
+                profile.visual_identity, profile.color_palette, do_guidelines_json,
+                dont_guidelines_json, profile.slogan, hashtags_json, 
+                profile.examples, now, now
+            )
+        )
+        conn.commit()
+        
+        print(f"Successfully created brand profile with ID: {profile_id}")
+        return profile_id
+    except sqlite3.Error as e:
+        print(f"SQLite error creating brand profile: {str(e)}")
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    except Exception as e:
+        print(f"Error creating brand profile: {str(e)}")
+        if conn:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create brand profile: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
+
+def get_brand_profile(profile_id: str) -> dict:
+    """Get a brand profile by ID"""
+    try:
+        conn = get_db_connection()
+        profile = conn.execute(
+            "SELECT * FROM brand_profiles WHERE id = ?",
+            (profile_id,)
+        ).fetchone()
+        conn.close()
+        
+        if profile:
+            profile_dict = dict(profile)
+            
+            # Parse JSON strings back to lists
+            profile_dict["values"] = json.loads(profile_dict["brand_values"])
+            if profile_dict["do_guidelines"]:
+                profile_dict["do_guidelines"] = json.loads(profile_dict["do_guidelines"])
+            if profile_dict["dont_guidelines"]:
+                profile_dict["dont_guidelines"] = json.loads(profile_dict["dont_guidelines"])
+            if profile_dict["hashtags"]:
+                profile_dict["hashtags"] = json.loads(profile_dict["hashtags"])
+            
+            return profile_dict
+        
+        raise HTTPException(status_code=404, detail="Brand profile not found")
+    except sqlite3.Error as sql_e:
+        print(f"Database error retrieving brand profile: {str(sql_e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(sql_e)}")
+    except json.JSONDecodeError as json_e:
+        print(f"JSON parsing error in brand profile: {str(json_e)}")
+        raise HTTPException(status_code=500, detail=f"Error parsing brand profile data: {str(json_e)}")
+    except Exception as e:
+        print(f"Error retrieving brand profile: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve brand profile: {str(e)}")
+
+def update_brand_profile(profile_id: str, profile_update: BrandProfileUpdate) -> dict:
+    """Update an existing brand profile"""
+    try:
+        # Get current profile
+        conn = get_db_connection()
+        current_profile = conn.execute(
+            "SELECT * FROM brand_profiles WHERE id = ?",
+            (profile_id,)
+        ).fetchone()
+        
+        if not current_profile:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Brand profile not found")
+        
+        current_profile = dict(current_profile)
+        
+        # Parse existing JSON fields
+        current_values = json.loads(current_profile["brand_values"])
+        current_do = json.loads(current_profile["do_guidelines"]) if current_profile["do_guidelines"] else None
+        current_dont = json.loads(current_profile["dont_guidelines"]) if current_profile["dont_guidelines"] else None
+        current_hashtags = json.loads(current_profile["hashtags"]) if current_profile["hashtags"] else None
+        
+        # Update with new values if provided
+        values = profile_update.values if profile_update.values is not None else current_values
+        do_guidelines = profile_update.do_guidelines if profile_update.do_guidelines is not None else current_do
+        dont_guidelines = profile_update.dont_guidelines if profile_update.dont_guidelines is not None else current_dont
+        hashtags = profile_update.hashtags if profile_update.hashtags is not None else current_hashtags
+        
+        # Convert back to JSON for storage
+        values_json = json.dumps(values)
+        do_guidelines_json = json.dumps(do_guidelines) if do_guidelines else None
+        dont_guidelines_json = json.dumps(dont_guidelines) if dont_guidelines else None
+        hashtags_json = json.dumps(hashtags) if hashtags else None
+        
+        # Get updated timestamp
+        now = datetime.datetime.now().isoformat()
+        
+        # Build update statement
+        update_fields = []
+        params = []
+        
+        if profile_update.brand_name is not None:
+            update_fields.append("brand_name = ?")
+            params.append(profile_update.brand_name)
+        
+        if profile_update.industry is not None:
+            update_fields.append("industry = ?")
+            params.append(profile_update.industry)
+        
+        if profile_update.description is not None:
+            update_fields.append("description = ?")
+            params.append(profile_update.description)
+        
+        if profile_update.tone_of_voice is not None:
+            update_fields.append("tone_of_voice = ?")
+            params.append(profile_update.tone_of_voice)
+        
+        if profile_update.values is not None:
+            update_fields.append("brand_values = ?")
+            params.append(values_json)
+        
+        if profile_update.target_audience is not None:
+            update_fields.append("target_audience = ?")
+            params.append(profile_update.target_audience)
+        
+        if profile_update.visual_identity is not None:
+            update_fields.append("visual_identity = ?")
+            params.append(profile_update.visual_identity)
+        
+        if profile_update.color_palette is not None:
+            update_fields.append("color_palette = ?")
+            params.append(profile_update.color_palette)
+        
+        if profile_update.do_guidelines is not None:
+            update_fields.append("do_guidelines = ?")
+            params.append(do_guidelines_json)
+        
+        if profile_update.dont_guidelines is not None:
+            update_fields.append("dont_guidelines = ?")
+            params.append(dont_guidelines_json)
+        
+        if profile_update.slogan is not None:
+            update_fields.append("slogan = ?")
+            params.append(profile_update.slogan)
+        
+        if profile_update.hashtags is not None:
+            update_fields.append("hashtags = ?")
+            params.append(hashtags_json)
+        
+        if profile_update.examples is not None:
+            update_fields.append("examples = ?")
+            params.append(profile_update.examples)
+        
+        # Always update the last_updated field
+        update_fields.append("last_updated = ?")
+        params.append(now)
+        
+        # Add profile_id to params
+        params.append(profile_id)
+        
+        # Execute update
+        conn.execute(
+            f"UPDATE brand_profiles SET {', '.join(update_fields)} WHERE id = ?",
+            params
+        )
+        conn.commit()
+        
+        # Get updated profile
+        updated_profile = conn.execute(
+            "SELECT * FROM brand_profiles WHERE id = ?",
+            (profile_id,)
+        ).fetchone()
+        
+        conn.close()
+        
+        if updated_profile:
+            profile_dict = dict(updated_profile)
+            
+            # Parse JSON fields
+            profile_dict["values"] = json.loads(profile_dict["brand_values"])
+            if profile_dict["do_guidelines"]:
+                profile_dict["do_guidelines"] = json.loads(profile_dict["do_guidelines"])
+            if profile_dict["dont_guidelines"]:
+                profile_dict["dont_guidelines"] = json.loads(profile_dict["dont_guidelines"])
+            if profile_dict["hashtags"]:
+                profile_dict["hashtags"] = json.loads(profile_dict["hashtags"])
+            
+            return profile_dict
+        
+        raise HTTPException(status_code=404, detail="Brand profile not found after update")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating brand profile: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update brand profile: {str(e)}")
+
+def list_brand_profiles(limit: int = 20, offset: int = 0) -> List[dict]:
+    """List brand profiles with pagination"""
+    try:
+        conn = get_db_connection()
+        profiles = conn.execute(
+            "SELECT * FROM brand_profiles ORDER BY last_updated DESC LIMIT ? OFFSET ?",
+            (limit, offset)
+        ).fetchall()
+        conn.close()
+        
+        result = []
+        for profile in profiles:
+            profile_dict = dict(profile)
+            
+            # Parse JSON fields
+            profile_dict["values"] = json.loads(profile_dict["brand_values"])
+            if profile_dict["do_guidelines"]:
+                profile_dict["do_guidelines"] = json.loads(profile_dict["do_guidelines"])
+            if profile_dict["dont_guidelines"]:
+                profile_dict["dont_guidelines"] = json.loads(profile_dict["dont_guidelines"])
+            if profile_dict["hashtags"]:
+                profile_dict["hashtags"] = json.loads(profile_dict["hashtags"])
+            
+            result.append(profile_dict)
+        
+        return result
+    except Exception as e:
+        print(f"Error listing brand profiles: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to list brand profiles: {str(e)}")
+
+def delete_brand_profile(profile_id: str) -> bool:
+    """Delete a brand profile by ID"""
+    try:
+        conn = get_db_connection()
+        
+        # Check if profile exists
+        profile = conn.execute(
+            "SELECT id FROM brand_profiles WHERE id = ?",
+            (profile_id,)
+        ).fetchone()
+        
+        if not profile:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Brand profile not found")
+        
+        # Delete the profile
+        conn.execute(
+            "DELETE FROM brand_profiles WHERE id = ?",
+            (profile_id,)
+        )
+        conn.commit()
+        conn.close()
+        
+        return True
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error deleting brand profile: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete brand profile: {str(e)}")
+
+# Function to get brand guidelines for ad generation
+def get_brand_guidelines_for_prompt(brand_profile_id: str) -> str:
+    """Format brand profile information into a prompt section for AI"""
+    try:
+        profile = get_brand_profile(brand_profile_id)
+        
+        guidelines = f"""
+Brand Guidelines for {profile['brand_name']}:
+- Description: {profile['description']}
+- Tone of Voice: {profile['tone_of_voice']}
+- Values: {', '.join(profile['values'])}
+- Target Audience: {profile['target_audience']}
+- Visual Identity: {profile['visual_identity']}"""
+
+        if profile.get('color_palette'):
+            guidelines += f"\n- Color Palette: {profile['color_palette']}"
+        
+        if profile.get('slogan'):
+            guidelines += f"\n- Slogan: {profile['slogan']}"
+        
+        if profile.get('do_guidelines'):
+            do_list = '\n  * '.join(profile['do_guidelines'])
+            guidelines += f"\n- DO:\n  * {do_list}"
+        
+        if profile.get('dont_guidelines'):
+            dont_list = '\n  * '.join(profile['dont_guidelines'])
+            guidelines += f"\n- DON'T:\n  * {dont_list}"
+        
+        if profile.get('hashtags'):
+            guidelines += f"\n- Hashtags: {', '.join(profile['hashtags'])}"
+        
+        return guidelines
+    except HTTPException:
+        # If profile doesn't exist, return empty guidelines
+        print(f"Brand profile with ID {brand_profile_id} not found. Continuing without brand guidelines.")
+        return ""
+    except Exception as e:
+        print(f"Error formatting brand guidelines: {str(e)}")
+        return ""
+
+# API Endpoints
+@app.get("/", tags=["General"])
+async def root():
+    return {"message": "Facebook Ad Generator API. Use /generate-ad-copy or /generate-image endpoints."}
+
+@app.post("/generate-ad-copy", response_model=AdCopyResponse, tags=["Ad Copy"])
+async def generate_ad_copy(request: AdCopyRequestWithBrand):
+    try:
+        # Construct prompt for ad copy generation
+        benefits_text = "\n".join([f"- {benefit}" for benefit in request.key_benefits])
+        
+        # Add brand guidelines if provided
+        brand_guidelines = ""
+        if request.brand_profile_id:
+            brand_guidelines = get_brand_guidelines_for_prompt(request.brand_profile_id)
+        
+        # Create the chat prompt with enhanced instructions
+        chat_prompt = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": """You are an expert Facebook advertising copywriter with over 10 years of experience creating high-converting ad copy for major brands. 
+
+You excel at crafting specific, compelling, and action-oriented ad copy that targets audience pain points and communicates clear benefits. Your headlines are attention-grabbing, your primary text tells a story that resonates with the audience, and your descriptions focus on tangible outcomes.
+
+Create Facebook ads with concrete details, specific claims, emotional appeals, and clear calls to action.
+
+Structure your response exactly as follows WITHOUT ANY MARKDOWN or asterisks:
+Headline: [Attention-grabbing headline with max 40 characters]
+Primary Text: [Compelling main copy that creates urgency and speaks directly to the audience]
+Description: [Additional benefits and strong call to action]"""
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"""Create a highly specific, benefit-driven Facebook ad for:
+                        
+Product/Service: {request.product_name}
+Target Audience: {request.target_audience}
+Key Benefits:
+{benefits_text}
+Tone: {request.tone}
+Length: {request.ad_length}
+{brand_guidelines}
+
+Guidelines:
+1. Headline: Create a specific, benefit-focused headline that mentions the product or a key number (max 40 characters)
+2. Primary Text: Start with a question or statement that addresses a pain point, then explain specific benefits with data/numbers when possible, and include social proof
+3. Description: Provide specific details about the product/service and end with a strong call to action
+
+Do not use generic phrases like "perfect solution" - be specific about exactly how the product solves problems.
+Include numbers, percentages, or timeframes when discussing benefits.
+DO NOT USE MARKDOWN FORMATTING or asterisks in your response.
+"""
+                    }
+                ]
+            }
+        ]
+        
+        # Generate completion
+        completion = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=chat_prompt,
+            max_tokens=800,
+            temperature=0.7,
+            top_p=0.95,
+            frequency_penalty=0.3,
+            presence_penalty=0.2,
+            stop=None,
+            stream=False
+        )
+        
+        # Parse the response to extract headline, primary text, and description
+        response_text = completion.choices[0].message.content
+        print(f"Raw response: {response_text}")
+        
+        # Improved parsing logic using regex patterns - remove markdown formatting
+        # Strip all asterisks and markdown formatting
+        clean_text = re.sub(r'\*+', '', response_text)
+        
+        headline_match = re.search(r"Headline:\s*(.*?)(?=\n*Primary Text:|$)", clean_text, re.IGNORECASE | re.DOTALL)
+        primary_text_match = re.search(r"Primary Text:\s*(.*?)(?=\n*Description:|$)", clean_text, re.IGNORECASE | re.DOTALL)
+        description_match = re.search(r"Description:\s*(.*?)(?=$)", clean_text, re.IGNORECASE | re.DOTALL)
+        
+        headline = headline_match.group(1).strip() if headline_match else "No headline generated"
+        primary_text = primary_text_match.group(1).strip() if primary_text_match else "No primary text generated"
+        description = description_match.group(1).strip() if description_match else "No description generated"
+        
+        ad_copy = AdCopyResponse(
+            headline=headline,
+            primary_text=primary_text,
+            description=description
+        )
+        
+        # Save to database
+        ad_copy_id = save_ad_copy_to_db(
+            product_name=request.product_name,
+            target_audience=request.target_audience,
+            headline=headline,
+            primary_text=primary_text,
+            description=description
+        )
+        
+        print(f"Parsed ad copy: {ad_copy}")
+        return ad_copy
+        
+    except Exception as e:
+        print(f"Error in generate_ad_copy: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating ad copy: {str(e)}")
+
+@app.post("/generate-image-recommendations", response_model=ImageAdResponse, tags=["Images"])
+async def generate_image_recommendations(request: ImageAdRequestWithBrand):
+    """Generate image recommendations for a Facebook ad"""
+    try:
+        # Add brand guidelines if provided
+        brand_guidelines = ""
+        if request.brand_profile_id:
+            brand_guidelines = get_brand_guidelines_for_prompt(request.brand_profile_id)
+        
+        # Format benefits for the prompt
+        benefits = "\n".join([f"- {benefit}" for benefit in request.key_benefits])
+        
+        # Create the chat prompt
+        chat_prompt = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "You are an expert in visual marketing and ad imagery. You specialize in creating specific, detailed image recommendations for Facebook ads that drive engagement and conversions."
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"""Create specific recommendations for Facebook ad imagery for:
+                        
+Product/Service: {request.product_name}
+Target Audience: {request.target_audience}
+Key Benefits:
+{benefits}
+Desired Tone: {request.tone}
+Preferred Image Style: {request.image_style}
+Color Scheme (if specified): {request.color_scheme or 'Not specified'}
+{brand_guidelines}
+
+Please provide:
+1. A detailed image prompt that could be used for image generation
+2. A specific description of what the image should contain
+3. Three recommendations for ad text that would pair well with the imagery
+"""
+                    }
+                ]
+            }
+        ]
+        
+        return generate_image_ad_recommendations(request)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error generating image recommendations: {str(e)}"
+        )
+
+@app.post("/generate-image", tags=["Images"])
+async def generate_image(request: ImageGenerationRequest):
+    """Generate an image using DALL-E 3"""
+    try:
+        result = generate_image_from_prompt(request.prompt, request.size)
+        return {
+            "id": result["id"],
+            "image_path": result["static_path"],
+            "revised_prompt": result["revised_prompt"]
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error generating image: {str(e)}"
+        )
+
+@app.post("/analyze-image", tags=["Images"])
+async def analyze_image(
+    file: UploadFile = File(...),
+    product_name: str = Form(...),
+    target_audience: str = Form(None)
+):
+    """Analyze an uploaded product image for Facebook ad effectiveness"""
+    try:
+        # Reset file position to start to ensure we can read the entire file
+        await file.seek(0)
+        
+        # Save the uploaded image
+        file_path = save_uploaded_image(file)
+        
+        # Analyze the image
+        analysis = analyze_image_content(file_path)
+        
+        return analysis
+    except Exception as e:
+        print(f"Error in analyze_image: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error analyzing image: {str(e)}"
+        )
+
+@app.post("/generate-captions", tags=["Images"])
+async def generate_captions(
+    file: UploadFile = File(...),
+    product_name: str = Form(...),
+    tone: str = Form("professional")
+):
+    """Generate captions for a product image"""
+    try:
+        # Save the uploaded image
+        file_path = save_uploaded_image(file)
+        
+        # Generate captions
+        captions = generate_image_captions(file_path, product_name, tone)
+        
+        return captions
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating captions: {str(e)}"
+        )
+
+@app.post("/generate-integrated-ad", response_model=IntegratedAdResponse, tags=["Integrated Ads"])
+async def generate_integrated_ad(request: IntegratedAdRequestWithBrand):
+    """Generate both ad copy and image recommendations for a Facebook ad"""
+    try:
+        # Generate ad copy
+        ad_copy_request = AdCopyRequestWithBrand(
+            product_name=request.product_name,
+            target_audience=request.target_audience,
+            key_benefits=request.key_benefits,
+            tone=request.tone,
+            ad_length=request.ad_length,
+            brand_profile_id=request.brand_profile_id if hasattr(request, 'brand_profile_id') else None
+        )
+        ad_copy = await generate_ad_copy(ad_copy_request)
+        
+        # Generate image recommendations
+        image_ad_request = ImageAdRequestWithBrand(
+            product_name=request.product_name,
+            target_audience=request.target_audience,
+            key_benefits=request.key_benefits,
+            tone=request.tone,
+            image_style=request.image_style,
+            color_scheme=request.color_scheme,
+            brand_profile_id=request.brand_profile_id if hasattr(request, 'brand_profile_id') else None
+        )
+        image_recommendations = await generate_image_recommendations(image_ad_request)
+        
+        # Generate actual image if requested
+        image_path = None
+        image_id = None
+        if request.generate_image:
+            image_result = generate_image_from_prompt(image_recommendations.image_prompt)
+            image_path = image_result["static_path"]
+            image_id = image_result["id"]
+        
+        # Save integrated ad to database
+        integrated_ad_id = save_integrated_ad_to_db(
+            product_name=request.product_name,
+            target_audience=request.target_audience,
+            ad_copy_id=None,  # We don't have this from the generate_ad_copy function yet
+            image_id=image_id
+        )
+        
+        # Combine responses
+        return IntegratedAdResponse(
+            headline=ad_copy.headline,
+            primary_text=ad_copy.primary_text,
+            description=ad_copy.description,
+            image_prompt=image_recommendations.image_prompt,
+            image_description=image_recommendations.image_description,
+            ad_text_recommendations=image_recommendations.ad_text_recommendations,
+            image_path=image_path
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error generating integrated ad: {str(e)}"
+        )
+
+@app.post("/create-complete-ad", response_model=IntegratedAdResponse, tags=["Integrated Ads"])
+async def create_complete_ad(
+    product_name: str = Form(...),
+    target_audience: str = Form(...),
+    key_benefits: str = Form(...),
+    tone: str = Form("professional"),
+    ad_length: str = Form("medium"),
+    image_style: str = Form("product photography"),
+    color_scheme: str = Form(None),
+    brand_profile_id: str = Form(None)
+):
+    """Create a complete ad with both copy and image in one simple request using form data"""
+    try:
+        # Parse key benefits from comma-separated string
+        benefits_list = [benefit.strip() for benefit in key_benefits.split(',')]
+        
+        # Create integrated ad request
+        request = IntegratedAdRequestWithBrand(
+            product_name=product_name,
+            target_audience=target_audience,
+            key_benefits=benefits_list,
+            tone=tone,
+            ad_length=ad_length,
+            image_style=image_style,
+            color_scheme=color_scheme,
+            generate_image=True,
+            brand_profile_id=brand_profile_id
+        )
+        
+        # Use the existing endpoint implementation
+        result = await generate_integrated_ad(request)
+        
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error creating complete ad: {str(e)}"
+        )
+
+# Add brand profile endpoints
+@app.post("/brand-profiles", response_model=BrandProfileResponse, tags=["Brand Profiles"])
+async def create_brand_profile_endpoint(profile: BrandProfileCreate):
+    """Create a new brand profile"""
+    profile_id = create_brand_profile(profile)
+    return get_brand_profile(profile_id)
+
+@app.get("/brand-profiles", response_model=List[BrandProfileResponse], tags=["Brand Profiles"])
+async def list_brand_profiles_endpoint(limit: int = 20, offset: int = 0):
+    """List all brand profiles with pagination"""
+    return list_brand_profiles(limit, offset)
+
+@app.get("/brand-profiles/{profile_id}", response_model=BrandProfileResponse, tags=["Brand Profiles"])
+async def get_brand_profile_endpoint(profile_id: str):
+    """Get a specific brand profile by ID"""
+    return get_brand_profile(profile_id)
+
+@app.patch("/brand-profiles/{profile_id}", response_model=BrandProfileResponse, tags=["Brand Profiles"])
+async def update_brand_profile_endpoint(profile_id: str, profile_update: BrandProfileUpdate):
+    """Update a brand profile"""
+    return update_brand_profile(profile_id, profile_update)
+
+@app.delete("/brand-profiles/{profile_id}", tags=["Brand Profiles"])
+async def delete_brand_profile_endpoint(profile_id: str):
+    """Delete a brand profile"""
+    delete_brand_profile(profile_id)
+    return {"success": True, "message": "Brand profile deleted successfully"}
+
+# Add new endpoints for image database
+@app.get("/images/recent", tags=["Database", "Images"])
+async def get_recent_images_endpoint(limit: int = 10):
+    """Get recent images from the database"""
+    images = get_recent_images(limit)
+    return {"images": images}
+
+@app.get("/images/{image_id}", tags=["Database", "Images"])
+async def get_image_endpoint(image_id: str):
+    """Get image details by ID"""
+    image = get_image_by_id(image_id)
+    if image:
+        return image
+    raise HTTPException(status_code=404, detail="Image not found")
+
+@app.get("/db/stats", tags=["Database"])
+async def get_db_stats():
+    """Get database statistics"""
+    try:
+        conn = get_db_connection()
+        
+        # Count items in each table
+        image_count = conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+        ad_copy_count = conn.execute("SELECT COUNT(*) FROM ad_copies").fetchone()[0]
+        integrated_ad_count = conn.execute("SELECT COUNT(*) FROM integrated_ads").fetchone()[0]
+        
+        # Get recent items
+        recent_images = conn.execute(
+            "SELECT id, filename, prompt, creation_date FROM images ORDER BY creation_date DESC LIMIT 5"
+        ).fetchall()
+        
+        recent_ad_copies = conn.execute(
+            "SELECT id, product_name, headline, creation_date FROM ad_copies ORDER BY creation_date DESC LIMIT 5"
+        ).fetchall()
+        
+        conn.close()
+        
+        return {
+            "counts": {
+                "images": image_count,
+                "ad_copies": ad_copy_count,
+                "integrated_ads": integrated_ad_count
+            },
+            "recent_images": [dict(img) for img in recent_images],
+            "recent_ad_copies": [dict(ad) for ad in recent_ad_copies]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting database stats: {str(e)}")
+
+@app.get("/ad-copies/recent", tags=["Database", "Ad Copy"])
+async def get_recent_ad_copies(limit: int = 10):
+    """Get recent ad copies from the database"""
+    try:
+        conn = get_db_connection()
+        ad_copies = conn.execute(
+            "SELECT * FROM ad_copies ORDER BY creation_date DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        
+        # Convert to list of dictionaries
+        result = []
+        for ad in ad_copies:
+            result.append(dict(ad))
+        
+        return {"ad_copies": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting recent ad copies: {str(e)}")
+
+@app.get("/integrated-ads/recent", tags=["Database", "Integrated Ads"])
+async def get_recent_integrated_ads(limit: int = 10):
+    """Get recent integrated ads from the database"""
+    try:
+        conn = get_db_connection()
+        integrated_ads = conn.execute(
+            "SELECT ia.*, ac.headline, ac.primary_text, ac.description, " +
+            "i.static_path as image_path, i.prompt as image_prompt " +
+            "FROM integrated_ads ia " +
+            "LEFT JOIN ad_copies ac ON ia.ad_copy_id = ac.id " +
+            "LEFT JOIN images i ON ia.image_id = i.id " +
+            "ORDER BY ia.creation_date DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        
+        # Convert to list of dictionaries
+        result = []
+        for ad in integrated_ads:
+            result.append(dict(ad))
+        
+        return {"integrated_ads": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting recent integrated ads: {str(e)}")
+
+# Add a simplified brand profile creation endpoint that accepts form data
+@app.post("/create-brand-profile", tags=["Brand Profiles"])
+async def create_brand_profile_form(
+    brand_name: str = Form(...),
+    industry: str = Form(None),
+    description: str = Form(...),
+    tone_of_voice: str = Form(...),
+    values: str = Form(...),  # Comma-separated values
+    target_audience: str = Form(...),
+    visual_identity: str = Form(...),
+    color_palette: str = Form(None),
+    do_guidelines: str = Form(None),  # Comma-separated guidelines
+    dont_guidelines: str = Form(None),  # Comma-separated guidelines
+    slogan: str = Form(None),
+    hashtags: str = Form(None),  # Comma-separated hashtags
+    examples: str = Form(None)
+):
+    """Create a brand profile using form data for easier submission"""
+    try:
+        # Parse comma-separated values into lists
+        values_list = [v.strip() for v in values.split(',')] if values else []
+        do_list = [do.strip() for do in do_guidelines.split(',')] if do_guidelines else None
+        dont_list = [dont.strip() for dont in dont_guidelines.split(',')] if dont_guidelines else None
+        hashtags_list = [tag.strip() for tag in hashtags.split(',')] if hashtags else None
+        
+        # Create profile request
+        profile = BrandProfileCreate(
+            brand_name=brand_name,
+            industry=industry,
+            description=description,
+            tone_of_voice=tone_of_voice,
+            values=values_list,
+            target_audience=target_audience,
+            visual_identity=visual_identity,
+            color_palette=color_palette,
+            do_guidelines=do_list,
+            dont_guidelines=dont_list,
+            slogan=slogan,
+            hashtags=hashtags_list,
+            examples=examples
+        )
+        
+        # Create the profile
+        profile_id = create_brand_profile(profile)
+        
+        # Return the created profile
+        return get_brand_profile(profile_id)
+    except Exception as e:
+        print(f"Error creating brand profile via form: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create brand profile: {str(e)}")
+
+# Add a helpful endpoint to check database initialization status
+@app.get("/db/check", tags=["Database"])
+async def check_database():
+    """Check if the database is properly initialized and return table information"""
+    try:
+        conn = get_db_connection()
+        # Get all tables
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+        
+        # Get column info for each table
+        schema_info = {}
+        for table in tables:
+            table_name = table[0]
+            columns = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            schema_info[table_name] = [
+                {"name": col[1], "type": col[2], "notnull": bool(col[3])} 
+                for col in columns
+            ]
+        
+        # Get row counts
+        counts = {}
+        for table in tables:
+            table_name = table[0]
+            count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+            counts[table_name] = count
+        
+        conn.close()
+        
+        return {
+            "status": "ok",
+            "tables": [table[0] for table in tables],
+            "schema": schema_info,
+            "row_counts": counts
+        }
+    except Exception as e:
+        print(f"Error checking database: {str(e)}")
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+# Add a test endpoint to verify brand profile functionality
+@app.post("/brand-profiles/test", tags=["Brand Profiles"])
+async def test_brand_profile():
+    """Create a test brand profile to verify functionality"""
+    try:
+        # Create a simple test profile
+        profile = BrandProfileCreate(
+            brand_name="Test Brand",
+            description="This is a test brand profile",
+            tone_of_voice="Professional",
+            values=["Quality", "Innovation", "Customer Focus"],
+            target_audience="Business professionals aged 25-45",
+            visual_identity="Modern, clean design with blue and gray color scheme",
+            color_palette="#1a73e8, #f5f5f5, #4285f4",
+            do_guidelines=["Use professional language", "Focus on benefits", "Include brand colors"],
+            dont_guidelines=["Don't use slang", "Avoid negative messaging"],
+            slogan="Innovate. Create. Succeed.",
+            hashtags=["#TestBrand", "#Innovation"],
+            examples="Sample ads using professional tone and highlighting product benefits."
+        )
+        
+        # Create profile and get ID
+        profile_id = create_brand_profile(profile)
+        
+        # Fetch the created profile to verify it worked
+        created_profile = get_brand_profile(profile_id)
+        
+        return {
+            "status": "success",
+            "message": "Test brand profile created successfully",
+            "profile_id": profile_id,
+            "profile": created_profile
+        }
+    except Exception as e:
+        print(f"Error in test brand profile: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Failed to create test brand profile: {str(e)}"
+        }
+
+# Add a database reset endpoint for development
+@app.post("/db/reset", tags=["Database"])
+async def reset_database():
+    """⚠️ WARNING: This deletes and recreates the database schema. FOR DEVELOPMENT USE ONLY ⚠️"""
+    try:
+        # Close any existing connections
+        conn = get_db_connection()
+        conn.close()
+        
+        # Delete the database file
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+        
+        # Initialize the database again
+        init_db()
+        
+        return {
+            "status": "success",
+            "message": "Database reset successfully. All tables have been recreated."
+        }
+    except Exception as e:
+        print(f"Error resetting database: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Failed to reset database: {str(e)}"
+        }
+
+# Run the app using uvicorn when executing the script directly
+if __name__ == "__main__":
+    import uvicorn
+    import sys
+    
+    port = 8000
+    if len(sys.argv) > 1:
+        try:
+            port = int(sys.argv[1])
+        except ValueError:
+            print(f"Invalid port number: {sys.argv[1]}. Using default port 8000.")
+    
+    print(f"Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
