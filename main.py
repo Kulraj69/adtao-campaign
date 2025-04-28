@@ -123,6 +123,26 @@ def init_db():
         )
         ''')
         
+        # Create competitor_ads table
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS competitor_ads (
+            id TEXT PRIMARY KEY,
+            competitor_name TEXT NOT NULL,
+            ad_image_path TEXT NOT NULL,
+            product_category TEXT NOT NULL,
+            target_audience TEXT,
+            analysis_data TEXT,
+            positioning TEXT,
+            typography TEXT,
+            visual_elements TEXT,
+            color_scheme TEXT,
+            effectiveness_score REAL,
+            is_exemplary BOOLEAN DEFAULT 0,
+            creation_date TEXT NOT NULL,
+            last_analyzed TEXT
+        )
+        ''')
+        
         conn.commit()
         print("Database initialized successfully")
         
@@ -170,6 +190,10 @@ app = FastAPI(
         {
             "name": "Database",
             "description": "Endpoints for accessing stored content and statistics"
+        },
+        {
+            "name": "Competitor Analysis",
+            "description": "Endpoints for managing competitor ads"
         }
     ],
     docs_url="/docs",
@@ -306,7 +330,36 @@ class BrandProfileUpdate(BaseModel):
     hashtags: Optional[List[str]] = None
     examples: Optional[str] = None
 
-# Extended request models to include brand integration
+# Competitor Ad models
+class CompetitorAdBase(BaseModel):
+    competitor_name: str = Field(..., description="Name of the competitor brand")
+    product_category: str = Field(..., description="Category of the product in the ad")
+    target_audience: Optional[str] = Field(None, description="Target audience for the competitor ad")
+
+class CompetitorAdCreate(CompetitorAdBase):
+    pass
+
+class CompetitorAdResponse(CompetitorAdBase):
+    id: str
+    ad_image_path: str
+    analysis_data: Optional[dict] = None
+    positioning: Optional[str] = None
+    typography: Optional[str] = None
+    visual_elements: Optional[str] = None
+    color_scheme: Optional[str] = None
+    creation_date: str
+    last_analyzed: Optional[str] = None
+
+class CompetitorAdAnalysisResponse(BaseModel):
+    id: str
+    competitor_name: str
+    positioning: str
+    typography: str
+    visual_elements: List[str]
+    color_scheme: str
+    guidelines: List[str]
+
+# Extended request models to include brand integration and competitor insights
 class AdCopyRequestWithBrand(AdCopyRequest):
     brand_profile_id: Optional[str] = None
 
@@ -315,6 +368,15 @@ class ImageAdRequestWithBrand(ImageAdRequest):
 
 class IntegratedAdRequestWithBrand(IntegratedAdRequest):
     brand_profile_id: Optional[str] = None
+
+class AdCopyRequestWithCompetitorInsights(AdCopyRequestWithBrand):
+    competitor_ids: Optional[List[str]] = None
+
+class ImageAdRequestWithCompetitorInsights(ImageAdRequestWithBrand):
+    competitor_ids: Optional[List[str]] = None
+
+class IntegratedAdRequestWithCompetitorInsights(IntegratedAdRequestWithBrand):
+    competitor_ids: Optional[List[str]] = None
 
 # Helper functions for image processing
 def save_uploaded_image(image: UploadFile) -> str:
@@ -1048,6 +1110,366 @@ Brand Guidelines for {profile['brand_name']}:
         print(f"Error formatting brand guidelines: {str(e)}")
         return ""
 
+# Competitor ad functions
+def save_competitor_ad(image_file: UploadFile, competitor_name: str, product_category: str, target_audience: str = None) -> str:
+    """Save a competitor ad to the database"""
+    try:
+        # Save the uploaded image
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        filename = f"competitor_{timestamp}_{unique_id}_{image_file.filename}"
+        
+        # Create full path
+        file_path = os.path.join(UPLOAD_DIR, filename)
+        static_path = f"/static/{filename}"
+        
+        # Copy to static directory for web access
+        contents = image_file.file.read()
+        
+        with open(file_path, "wb") as f:
+            f.write(contents)
+        
+        # Create a copy in the static directory
+        static_file_path = os.path.join(STATIC_DIR, filename)
+        with open(static_file_path, "wb") as f:
+            f.write(contents)
+        
+        # Reset file cursor
+        image_file.file.seek(0)
+        
+        # Create a unique ID
+        competitor_ad_id = str(uuid.uuid4())
+        
+        # Get current date/time
+        creation_date = datetime.datetime.now().isoformat()
+        
+        # Insert into database
+        conn = get_db_connection()
+        conn.execute(
+            """INSERT INTO competitor_ads (
+                id, competitor_name, ad_image_path, product_category, 
+                target_audience, creation_date
+            ) VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                competitor_ad_id, competitor_name, static_path, 
+                product_category, target_audience, creation_date
+            )
+        )
+        conn.commit()
+        conn.close()
+        
+        return competitor_ad_id
+    except Exception as e:
+        print(f"Error saving competitor ad: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save competitor ad: {str(e)}")
+
+def analyze_competitor_ad(competitor_ad_id: str) -> dict:
+    """Analyze a competitor ad for positioning, typography, and visual elements"""
+    try:
+        # Get the competitor ad data
+        conn = get_db_connection()
+        ad = conn.execute(
+            "SELECT * FROM competitor_ads WHERE id = ?",
+            (competitor_ad_id,)
+        ).fetchone()
+        
+        if not ad:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Competitor ad not found")
+        
+        ad = dict(ad)
+        conn.close()
+        
+        # Get the image file path
+        image_path = os.path.join(STATIC_DIR, os.path.basename(ad["ad_image_path"]))
+        
+        # If static path starts with /static/, adjust it
+        if not os.path.exists(image_path) and ad["ad_image_path"].startswith("/static/"):
+            image_path = os.path.join(STATIC_DIR, os.path.basename(ad["ad_image_path"]))
+        
+        # Check if file exists
+        if not os.path.exists(image_path):
+            raise HTTPException(status_code=404, detail=f"Image file not found at {image_path}")
+        
+        # Analyze the image with Azure OpenAI vision
+        with open(image_path, "rb") as image_file:
+            encoded_image = base64.b64encode(image_file.read()).decode('ascii')
+        
+        # Create Azure OpenAI request with the image
+        chat_prompt = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": """You are an expert in advertising design, with deep knowledge of marketing positioning, typography, and visual elements. 
+                        Analyze this advertisement in detail, looking specifically at:
+                        1. Positioning: How the ad positions the product/service (premium, value, innovator, etc.)
+                        2. Typography: Fonts used, text arrangement, emphasis
+                        3. Visual Elements: Image composition, use of people/objects, focal points
+                        4. Color Scheme: Dominant colors and how they're used
+                        5. Effectiveness: Rate the overall ad effectiveness from 0-10, where 10 is extremely effective
+                        
+                        Then, provide actionable guidelines that could be derived from this ad's design approach."""
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Analyze this competitor ad for {ad['competitor_name']} in the {ad['product_category']} category. Provide detailed analysis on positioning, typography, visual elements, and color scheme, followed by an effectiveness score (0-10) and actionable guidelines we could apply to our own ads."
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{encoded_image}"
+                        }
+                    }
+                ]
+            }
+        ]
+        
+        # Call Azure OpenAI
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=chat_prompt,
+            max_tokens=1000,
+            temperature=0.5
+        )
+        
+        # Process the analysis
+        analysis_text = response.choices[0].message.content
+        
+        # Extract sections (this is a simple parsing approach)
+        positioning = ""
+        typography = ""
+        visual_elements = []
+        color_scheme = ""
+        guidelines = []
+        effectiveness_score = 0.0
+        
+        # Simple parsing - in production, you'd want more robust extraction
+        sections = analysis_text.split("\n\n")
+        for section in sections:
+            if "positioning" in section.lower():
+                positioning = section.split(":", 1)[1].strip() if ":" in section else section
+            elif "typography" in section.lower():
+                typography = section.split(":", 1)[1].strip() if ":" in section else section
+            elif "visual elements" in section.lower() or "visuals" in section.lower():
+                visual_text = section.split(":", 1)[1].strip() if ":" in section else section
+                visual_elements = [item.strip() for item in visual_text.split("-") if item.strip()]
+            elif "color" in section.lower():
+                color_scheme = section.split(":", 1)[1].strip() if ":" in section else section
+            elif "effectiveness" in section.lower() or "score" in section.lower() or "rating" in section.lower():
+                # Extract the effectiveness score
+                score_text = section.split(":", 1)[1].strip() if ":" in section else section
+                # Look for a number from 0-10 in the text
+                score_match = re.search(r"(\d+(?:\.\d+)?)/10|(\d+(?:\.\d+)?)\s*out of\s*10|(\d+(?:\.\d+)?)(?:/|\s*out of\s*)?\s*10", score_text)
+                if score_match:
+                    # Get the matched group that contains the number
+                    matched_group = next(group for group in score_match.groups() if group is not None)
+                    effectiveness_score = float(matched_group)
+                else:
+                    # Try to extract any number between 0 and 10
+                    number_match = re.search(r"(\d+(?:\.\d+)?)", score_text)
+                    if number_match:
+                        score = float(number_match.group(1))
+                        if 0 <= score <= 10:
+                            effectiveness_score = score
+            elif "guidelines" in section.lower() or "recommendations" in section.lower():
+                guidelines_text = section.split(":", 1)[1].strip() if ":" in section else section
+                guidelines = [item.strip() for item in guidelines_text.split("-") if item.strip()]
+        
+        # Set is_exemplary flag for ads with high scores
+        is_exemplary = effectiveness_score >= 8.0
+        
+        # Save the analysis to the database
+        conn = get_db_connection()
+        conn.execute(
+            """UPDATE competitor_ads SET 
+            analysis_data = ?, positioning = ?, typography = ?, 
+            visual_elements = ?, color_scheme = ?, effectiveness_score = ?,
+            is_exemplary = ?, last_analyzed = ?
+            WHERE id = ?""",
+            (
+                analysis_text, positioning, typography,
+                json.dumps(visual_elements), color_scheme, effectiveness_score,
+                is_exemplary, datetime.datetime.now().isoformat(),
+                competitor_ad_id
+            )
+        )
+        conn.commit()
+        conn.close()
+        
+        return {
+            "id": competitor_ad_id,
+            "competitor_name": ad["competitor_name"],
+            "positioning": positioning,
+            "typography": typography,
+            "visual_elements": visual_elements,
+            "color_scheme": color_scheme,
+            "effectiveness_score": effectiveness_score,
+            "is_exemplary": is_exemplary,
+            "guidelines": guidelines,
+            "full_analysis": analysis_text
+        }
+    except Exception as e:
+        print(f"Error analyzing competitor ad: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to analyze competitor ad: {str(e)}")
+
+def get_competitor_ad(competitor_ad_id: str) -> dict:
+    """Get a competitor ad by ID"""
+    try:
+        conn = get_db_connection()
+        ad = conn.execute(
+            "SELECT * FROM competitor_ads WHERE id = ?",
+            (competitor_ad_id,)
+        ).fetchone()
+        conn.close()
+        
+        if ad:
+            ad_dict = dict(ad)
+            
+            # Parse JSON fields
+            if ad_dict["visual_elements"]:
+                try:
+                    ad_dict["visual_elements"] = json.loads(ad_dict["visual_elements"])
+                except:
+                    ad_dict["visual_elements"] = []
+            else:
+                ad_dict["visual_elements"] = []
+            
+            return ad_dict
+        
+        raise HTTPException(status_code=404, detail="Competitor ad not found")
+    except Exception as e:
+        print(f"Error getting competitor ad: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get competitor ad: {str(e)}")
+
+def list_competitor_ads(limit: int = 20, offset: int = 0, product_category: str = None) -> List[dict]:
+    """List competitor ads with optional filtering by product category"""
+    try:
+        conn = get_db_connection()
+        
+        if product_category:
+            ads = conn.execute(
+                "SELECT * FROM competitor_ads WHERE product_category = ? ORDER BY creation_date DESC LIMIT ? OFFSET ?",
+                (product_category, limit, offset)
+            ).fetchall()
+        else:
+            ads = conn.execute(
+                "SELECT * FROM competitor_ads ORDER BY creation_date DESC LIMIT ? OFFSET ?",
+                (limit, offset)
+            ).fetchall()
+        
+        conn.close()
+        
+        result = []
+        for ad in ads:
+            ad_dict = dict(ad)
+            
+            # Parse JSON fields
+            if ad_dict["visual_elements"]:
+                try:
+                    ad_dict["visual_elements"] = json.loads(ad_dict["visual_elements"])
+                except:
+                    ad_dict["visual_elements"] = []
+            else:
+                ad_dict["visual_elements"] = []
+            
+            result.append(ad_dict)
+        
+        return result
+    except Exception as e:
+        print(f"Error listing competitor ads: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to list competitor ads: {str(e)}")
+
+def get_competitor_guidelines_for_prompt(competitor_ids: List[str] = None, use_exemplary: bool = True, category: str = None, limit: int = 3) -> str:
+    """Format competitor ad insights into a prompt section for AI"""
+    try:
+        guidelines = "\nCompetitor Ad Insights:"
+        
+        # If specific competitor IDs are provided, use those
+        if competitor_ids and len(competitor_ids) > 0:
+            for comp_id in competitor_ids:
+                try:
+                    ad = get_competitor_ad(comp_id)
+                    
+                    guidelines += f"\n\nCompetitor: {ad['competitor_name']} ({ad['product_category']})"
+                    
+                    if ad["positioning"]:
+                        guidelines += f"\n- Positioning: {ad['positioning']}"
+                    
+                    if ad["typography"]:
+                        guidelines += f"\n- Typography: {ad['typography']}"
+                    
+                    if ad["visual_elements"] and len(ad["visual_elements"]) > 0:
+                        elements = "\n  * ".join(ad["visual_elements"])
+                        guidelines += f"\n- Visual Elements:\n  * {elements}"
+                    
+                    if ad["color_scheme"]:
+                        guidelines += f"\n- Color Scheme: {ad['color_scheme']}"
+                except:
+                    # Skip this competitor if there's an error
+                    continue
+        # Otherwise, if use_exemplary is True, use the best performing ads
+        elif use_exemplary:
+            exemplary_ads = get_exemplary_competitor_ads(category=category, limit=limit)
+            
+            if not exemplary_ads:
+                # If no exemplary ads, try getting any ads for the category
+                conn = get_db_connection()
+                if category:
+                    ads = conn.execute(
+                        "SELECT * FROM competitor_ads WHERE product_category = ? ORDER BY effectiveness_score DESC LIMIT ?",
+                        (category, limit)
+                    ).fetchall()
+                else:
+                    ads = conn.execute(
+                        "SELECT * FROM competitor_ads ORDER BY effectiveness_score DESC LIMIT ?",
+                        (limit,)
+                    ).fetchall()
+                conn.close()
+                
+                exemplary_ads = []
+                for ad in ads:
+                    ad_dict = dict(ad)
+                    if ad_dict["visual_elements"]:
+                        try:
+                            ad_dict["visual_elements"] = json.loads(ad_dict["visual_elements"])
+                        except:
+                            ad_dict["visual_elements"] = []
+                    else:
+                        ad_dict["visual_elements"] = []
+                    exemplary_ads.append(ad_dict)
+            
+            for ad in exemplary_ads:
+                guidelines += f"\n\nCompetitor: {ad['competitor_name']} ({ad['product_category']}) - Score: {ad.get('effectiveness_score', 'N/A')}"
+                
+                if ad.get("positioning"):
+                    guidelines += f"\n- Positioning: {ad['positioning']}"
+                
+                if ad.get("typography"):
+                    guidelines += f"\n- Typography: {ad['typography']}"
+                
+                if ad.get("visual_elements") and len(ad["visual_elements"]) > 0:
+                    elements = "\n  * ".join(ad["visual_elements"])
+                    guidelines += f"\n- Visual Elements:\n  * {elements}"
+                
+                if ad.get("color_scheme"):
+                    guidelines += f"\n- Color Scheme: {ad['color_scheme']}"
+        
+        # If we have no insights, return empty string
+        if guidelines == "\nCompetitor Ad Insights:":
+            return ""
+            
+        return guidelines
+    except Exception as e:
+        print(f"Error formatting competitor guidelines: {str(e)}")
+        return ""
+
 # API Endpoints
 @app.get("/", tags=["General"])
 async def root():
@@ -1350,15 +1772,23 @@ async def create_complete_ad(
     ad_length: str = Form("medium"),
     image_style: str = Form("product photography"),
     color_scheme: str = Form(None),
-    brand_profile_id: str = Form(None)
+    brand_profile_id: str = Form(None),
+    competitor_ids: str = Form(None),  # Comma-separated list of competitor ad IDs
+    use_exemplary_ads: bool = Form(True),  # Whether to use exemplary ads if no specific IDs are provided
+    product_category: str = Form(None)  # Product category for finding relevant exemplary ads
 ):
     """Create a complete ad with both copy and image in one simple request using form data"""
     try:
         # Parse key benefits from comma-separated string
         benefits_list = [benefit.strip() for benefit in key_benefits.split(',')]
         
+        # Parse competitor IDs if provided
+        competitor_ids_list = None
+        if competitor_ids:
+            competitor_ids_list = [comp_id.strip() for comp_id in competitor_ids.split(',')]
+        
         # Create integrated ad request
-        request = IntegratedAdRequestWithBrand(
+        request = IntegratedAdRequestWithCompetitorInsights(
             product_name=product_name,
             target_audience=target_audience,
             key_benefits=benefits_list,
@@ -1367,13 +1797,294 @@ async def create_complete_ad(
             image_style=image_style,
             color_scheme=color_scheme,
             generate_image=True,
-            brand_profile_id=brand_profile_id
+            brand_profile_id=brand_profile_id,
+            competitor_ids=competitor_ids_list
         )
         
-        # Use the existing endpoint implementation
-        result = await generate_integrated_ad(request)
+        # Use the existing endpoint implementation with modifications
+        try:
+            # Generate ad copy
+            ad_copy_request = AdCopyRequestWithCompetitorInsights(
+                product_name=request.product_name,
+                target_audience=request.target_audience,
+                key_benefits=request.key_benefits,
+                tone=request.tone,
+                ad_length=request.ad_length,
+                brand_profile_id=request.brand_profile_id if hasattr(request, 'brand_profile_id') else None,
+                competitor_ids=request.competitor_ids if hasattr(request, 'competitor_ids') else None
+            )
+            
+            # Add competitor guidelines to ad copy generation
+            benefits_text = "\n".join([f"- {benefit}" for benefit in ad_copy_request.key_benefits])
+            
+            # Add brand guidelines if provided
+            brand_guidelines = ""
+            if hasattr(ad_copy_request, 'brand_profile_id') and ad_copy_request.brand_profile_id:
+                brand_guidelines = get_brand_guidelines_for_prompt(ad_copy_request.brand_profile_id)
+            
+            # Add competitor guidelines
+            competitor_guidelines = ""
+            if hasattr(ad_copy_request, 'competitor_ids') and ad_copy_request.competitor_ids:
+                competitor_guidelines = get_competitor_guidelines_for_prompt(
+                    competitor_ids=ad_copy_request.competitor_ids,
+                    use_exemplary=False
+                )
+            elif use_exemplary_ads:
+                # Use exemplary ads if no specific IDs provided and use_exemplary_ads is True
+                competitor_guidelines = get_competitor_guidelines_for_prompt(
+                    use_exemplary=True,
+                    category=product_category
+                )
+            
+            # Create the chat prompt with enhanced instructions
+            chat_prompt = [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """You are an expert Facebook advertising copywriter with over 10 years of experience creating high-converting ad copy for major brands. 
+
+You excel at crafting specific, compelling, and action-oriented ad copy that targets audience pain points and communicates clear benefits. Your headlines are attention-grabbing, your primary text tells a story that resonates with the audience, and your descriptions focus on tangible outcomes.
+
+Create Facebook ads with concrete details, specific claims, emotional appeals, and clear calls to action.
+
+Structure your response exactly as follows WITHOUT ANY MARKDOWN or asterisks:
+Headline: [Attention-grabbing headline with max 40 characters]
+Primary Text: [Compelling main copy that creates urgency and speaks directly to the audience]
+Description: [Additional benefits and strong call to action]"""
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"""Create a highly specific, benefit-driven Facebook ad for:
+                            
+Product/Service: {ad_copy_request.product_name}
+Target Audience: {ad_copy_request.target_audience}
+Key Benefits:
+{benefits_text}
+Tone: {ad_copy_request.tone}
+Length: {ad_copy_request.ad_length}
+{brand_guidelines}
+{competitor_guidelines}
+
+Guidelines:
+1. Headline: Create a specific, benefit-focused headline that mentions the product or a key number (max 40 characters)
+2. Primary Text: Start with a question or statement that addresses a pain point, then explain specific benefits with data/numbers when possible, and include social proof
+3. Description: Provide specific details about the product/service and end with a strong call to action
+
+Do not use generic phrases like "perfect solution" - be specific about exactly how the product solves problems.
+Include numbers, percentages, or timeframes when discussing benefits.
+DO NOT USE MARKDOWN FORMATTING or asterisks in your response.
+"""
+                        }
+                    ]
+                }
+            ]
+            
+            # Generate completion
+            completion = client.chat.completions.create(
+                model=DEPLOYMENT_NAME,
+                messages=chat_prompt,
+                max_tokens=800,
+                temperature=0.7,
+                top_p=0.95,
+                frequency_penalty=0.3,
+                presence_penalty=0.2,
+                stop=None,
+                stream=False
+            )
+            
+            # Parse the response to extract headline, primary text, and description
+            response_text = completion.choices[0].message.content
+            print(f"Raw response: {response_text}")
+            
+            # Improved parsing logic using regex patterns - remove markdown formatting
+            # Strip all asterisks and markdown formatting
+            clean_text = re.sub(r'\*+', '', response_text)
+            
+            headline_match = re.search(r"Headline:\s*(.*?)(?=\n*Primary Text:|$)", clean_text, re.IGNORECASE | re.DOTALL)
+            primary_text_match = re.search(r"Primary Text:\s*(.*?)(?=\n*Description:|$)", clean_text, re.IGNORECASE | re.DOTALL)
+            description_match = re.search(r"Description:\s*(.*?)(?=$)", clean_text, re.IGNORECASE | re.DOTALL)
+            
+            headline = headline_match.group(1).strip() if headline_match else "No headline generated"
+            primary_text = primary_text_match.group(1).strip() if primary_text_match else "No primary text generated"
+            description = description_match.group(1).strip() if description_match else "No description generated"
+            
+            ad_copy = AdCopyResponse(
+                headline=headline,
+                primary_text=primary_text,
+                description=description
+            )
+            
+            # Generate image recommendations
+            image_ad_request = ImageAdRequestWithCompetitorInsights(
+                product_name=request.product_name,
+                target_audience=request.target_audience,
+                key_benefits=request.key_benefits,
+                tone=request.tone,
+                image_style=request.image_style,
+                color_scheme=request.color_scheme,
+                brand_profile_id=request.brand_profile_id if hasattr(request, 'brand_profile_id') else None,
+                competitor_ids=request.competitor_ids if hasattr(request, 'competitor_ids') else None
+            )
+            
+            # Add competitor guidelines to image generation too
+            # Format benefits for the prompt
+            benefits = "\n".join([f"- {benefit}" for benefit in image_ad_request.key_benefits])
+            
+            # Add brand guidelines if provided
+            brand_guidelines = ""
+            if hasattr(image_ad_request, 'brand_profile_id') and image_ad_request.brand_profile_id:
+                brand_guidelines = get_brand_guidelines_for_prompt(image_ad_request.brand_profile_id)
+            
+            # Add competitor guidelines
+            competitor_guidelines = ""
+            if hasattr(image_ad_request, 'competitor_ids') and image_ad_request.competitor_ids:
+                competitor_guidelines = get_competitor_guidelines_for_prompt(
+                    competitor_ids=image_ad_request.competitor_ids,
+                    use_exemplary=False
+                )
+            elif use_exemplary_ads:
+                # Use exemplary ads if no specific IDs provided and use_exemplary_ads is True
+                competitor_guidelines = get_competitor_guidelines_for_prompt(
+                    use_exemplary=True,
+                    category=product_category
+                )
+            
+            # Create the chat prompt
+            chat_prompt = [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You are an expert in visual marketing and ad imagery. You specialize in creating specific, detailed image recommendations for Facebook ads that drive engagement and conversions."
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"""Create specific recommendations for Facebook ad imagery for:
+                            
+Product/Service: {image_ad_request.product_name}
+Target Audience: {image_ad_request.target_audience}
+Key Benefits:
+{benefits}
+Desired Tone: {image_ad_request.tone}
+Preferred Image Style: {image_ad_request.image_style}
+Color Scheme (if specified): {image_ad_request.color_scheme or 'Not specified'}
+{brand_guidelines}
+{competitor_guidelines}
+
+Please provide:
+1. A detailed image prompt that could be used for image generation
+2. A specific description of what the image should contain
+3. Three recommendations for ad text that would pair well with the imagery
+"""
+                        }
+                    ]
+                }
+            ]
+            
+            # Generate completion
+            completion = client.chat.completions.create(
+                model=DEPLOYMENT_NAME,
+                messages=chat_prompt,
+                max_tokens=1000,
+                temperature=0.7,
+                top_p=0.95
+            )
+            
+            # Extract the response
+            response_text = completion.choices[0].message.content
+            
+            # Parse the response (this is a simple example; you might want more robust parsing)
+            # For demonstration purposes, we'll extract sections based on numbering and headers
+            sections = response_text.split("\n\n")
+            
+            image_prompt = ""
+            image_description = ""
+            ad_text_recommendations = []
+            
+            for section in sections:
+                if "image prompt" in section.lower():
+                    image_prompt = section.split(":", 1)[1].strip() if ":" in section else section
+                elif "description" in section.lower():
+                    image_description = section.split(":", 1)[1].strip() if ":" in section else section
+                elif "recommendation" in section.lower() or "ad text" in section.lower():
+                    # Extract numbered recommendations
+                    lines = section.split("\n")
+                    for line in lines:
+                        if any(line.strip().startswith(str(i)) for i in range(1, 4)):
+                            text = line.split(".", 1)[1].strip() if "." in line else line
+                            if text and len(text) > 5:  # Basic validation
+                                ad_text_recommendations.append(text)
+            
+            # If parsing fails, use placeholders
+            if not image_prompt:
+                image_prompt = "No specific image prompt generated"
+            if not image_description:
+                image_description = "No image description generated"
+            if not ad_text_recommendations:
+                ad_text_recommendations = ["No specific ad text recommendations generated"]
+            
+            image_recommendations = ImageAdResponse(
+                image_prompt=image_prompt,
+                image_description=image_description,
+                ad_text_recommendations=ad_text_recommendations
+            )
+            
+            # Generate actual image if requested
+            image_path = None
+            image_id = None
+            if request.generate_image:
+                image_result = generate_image_from_prompt(image_recommendations.image_prompt)
+                image_path = image_result["static_path"]
+                image_id = image_result["id"]
+            
+            # Save ad copy to database
+            ad_copy_id = save_ad_copy_to_db(
+                product_name=request.product_name,
+                target_audience=request.target_audience,
+                headline=headline,
+                primary_text=primary_text,
+                description=description
+            )
+            
+            # Save integrated ad to database
+            integrated_ad_id = save_integrated_ad_to_db(
+                product_name=request.product_name,
+                target_audience=request.target_audience,
+                ad_copy_id=ad_copy_id,
+                image_id=image_id
+            )
+            
+            # Combine responses
+            return IntegratedAdResponse(
+                headline=ad_copy.headline,
+                primary_text=ad_copy.primary_text,
+                description=ad_copy.description,
+                image_prompt=image_recommendations.image_prompt,
+                image_description=image_recommendations.image_description,
+                ad_text_recommendations=image_recommendations.ad_text_recommendations,
+                image_path=image_path
+            )
+            
+        except Exception as e:
+            print(f"Error in integrated ad generation: {str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Error generating integrated ad: {str(e)}"
+            )
         
-        return result
     except Exception as e:
         raise HTTPException(
             status_code=500, 
@@ -1662,6 +2373,305 @@ async def reset_database():
             "status": "error",
             "message": f"Failed to reset database: {str(e)}"
         }
+
+# Competitor Ad Endpoints
+@app.post("/competitor-ads", tags=["Competitor Analysis"])
+async def upload_competitor_ad(
+    competitor_name: str = Form(...),
+    product_category: str = Form(...),
+    target_audience: str = Form(None),
+    file: UploadFile = File(...)
+):
+    """Upload a competitor's ad image for analysis"""
+    try:
+        # Validate file is an image
+        content_type = file.content_type
+        if not content_type.startswith("image/"):
+            raise HTTPException(
+                status_code=400, 
+                detail="File must be an image (jpeg, png, etc.)"
+            )
+        
+        # Save the competitor ad
+        competitor_ad_id = save_competitor_ad(
+            file, competitor_name, product_category, target_audience
+        )
+        
+        # Automatically analyze the ad when it's uploaded
+        analysis_result = analyze_competitor_ad(competitor_ad_id)
+        
+        # Return the analysis result instead of just the ad data
+        return analysis_result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error uploading competitor ad: {str(e)}"
+        )
+
+@app.get("/competitor-ads", tags=["Competitor Analysis"])
+async def list_competitor_ads_endpoint(
+    limit: int = 20, 
+    offset: int = 0,
+    product_category: str = None
+):
+    """List competitor ads with optional filtering by product category"""
+    return list_competitor_ads(limit, offset, product_category)
+
+@app.get("/competitor-ads/{competitor_ad_id}", tags=["Competitor Analysis"])
+async def get_competitor_ad_endpoint(competitor_ad_id: str):
+    """Get a specific competitor ad by ID"""
+    return get_competitor_ad(competitor_ad_id)
+
+@app.post("/competitor-ads/{competitor_ad_id}/analyze", tags=["Competitor Analysis"])
+async def analyze_competitor_ad_endpoint(competitor_ad_id: str):
+    """Analyze a competitor ad for positioning, typography, and visual elements"""
+    return analyze_competitor_ad(competitor_ad_id)
+
+@app.delete("/competitor-ads/{competitor_ad_id}", tags=["Competitor Analysis"])
+async def delete_competitor_ad(competitor_ad_id: str):
+    """Delete a competitor ad"""
+    try:
+        conn = get_db_connection()
+        
+        # Get the ad to check it exists and to get the image path
+        ad = conn.execute(
+            "SELECT * FROM competitor_ads WHERE id = ?",
+            (competitor_ad_id,)
+        ).fetchone()
+        
+        if not ad:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Competitor ad not found")
+        
+        ad = dict(ad)
+        
+        # Delete from database
+        conn.execute(
+            "DELETE FROM competitor_ads WHERE id = ?",
+            (competitor_ad_id,)
+        )
+        conn.commit()
+        conn.close()
+        
+        # Try to delete the image file if it exists
+        try:
+            image_path = os.path.join(STATIC_DIR, os.path.basename(ad["ad_image_path"]))
+            if os.path.exists(image_path):
+                os.remove(image_path)
+        except:
+            # Continue even if file deletion fails
+            pass
+        
+        return {"success": True, "message": "Competitor ad deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error deleting competitor ad: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete competitor ad: {str(e)}")
+
+# Add these functions to handle batch uploads and retrieving exemplary ads
+
+def get_exemplary_competitor_ads(category: str = None, limit: int = 10, offset: int = 0) -> List[dict]:
+    """Get high-performing competitor ads (those marked as exemplary)"""
+    try:
+        conn = get_db_connection()
+        
+        if category:
+            # Filter by category if provided
+            ads = conn.execute(
+                """SELECT * FROM competitor_ads 
+                WHERE is_exemplary = 1 AND product_category = ? 
+                ORDER BY effectiveness_score DESC LIMIT ? OFFSET ?""",
+                (category, limit, offset)
+            ).fetchall()
+        else:
+            # Get all exemplary ads across categories
+            ads = conn.execute(
+                """SELECT * FROM competitor_ads 
+                WHERE is_exemplary = 1 
+                ORDER BY effectiveness_score DESC LIMIT ? OFFSET ?""",
+                (limit, offset)
+            ).fetchall()
+        
+        conn.close()
+        
+        result = []
+        for ad in ads:
+            ad_dict = dict(ad)
+            
+            # Parse JSON fields
+            if ad_dict["visual_elements"]:
+                try:
+                    ad_dict["visual_elements"] = json.loads(ad_dict["visual_elements"])
+                except:
+                    ad_dict["visual_elements"] = []
+            else:
+                ad_dict["visual_elements"] = []
+            
+            result.append(ad_dict)
+        
+        return result
+    except Exception as e:
+        print(f"Error getting exemplary competitor ads: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get exemplary competitor ads: {str(e)}")
+
+def get_competitor_insights_summary() -> dict:
+    """Get a summary of insights from exemplary ads"""
+    try:
+        # Connect to database
+        conn = get_db_connection()
+        
+        # Get counts
+        total_ads = conn.execute("SELECT COUNT(*) FROM competitor_ads").fetchone()[0]
+        exemplary_ads = conn.execute("SELECT COUNT(*) FROM competitor_ads WHERE is_exemplary = 1").fetchone()[0]
+        
+        # Get average effectiveness score
+        avg_score = conn.execute("SELECT AVG(effectiveness_score) FROM competitor_ads").fetchone()[0]
+        
+        # Get top categories
+        categories = conn.execute(
+            "SELECT product_category, COUNT(*) as count FROM competitor_ads GROUP BY product_category ORDER BY count DESC LIMIT 5"
+        ).fetchall()
+        
+        # Get top competitors
+        competitors = conn.execute(
+            "SELECT competitor_name, COUNT(*) as count FROM competitor_ads GROUP BY competitor_name ORDER BY count DESC LIMIT 5"
+        ).fetchall()
+        
+        # Get most common visual elements from exemplary ads
+        # This is a bit tricky since visual_elements is stored as JSON
+        exemplary_ads_data = conn.execute(
+            "SELECT visual_elements FROM competitor_ads WHERE is_exemplary = 1"
+        ).fetchall()
+        
+        # Process visual elements 
+        element_counts = {}
+        for ad in exemplary_ads_data:
+            if ad[0]:  # Check if visual_elements is not None
+                try:
+                    elements = json.loads(ad[0])
+                    for element in elements:
+                        # Count the occurrences of keywords
+                        for keyword in ["people", "person", "product", "text", "background", "color", "logo"]:
+                            if keyword in element.lower():
+                                element_counts[keyword] = element_counts.get(keyword, 0) + 1
+                except json.JSONDecodeError:
+                    # Skip if we can't parse the JSON
+                    pass
+        
+        # Sort element_counts by value (count)
+        sorted_elements = sorted(element_counts.items(), key=lambda x: x[1], reverse=True)
+        
+        conn.close()
+        
+        return {
+            "total_ads": total_ads,
+            "exemplary_ads": exemplary_ads,
+            "avg_effectiveness_score": avg_score if avg_score else 0,
+            "top_categories": [{"category": cat[0], "count": cat[1]} for cat in categories],
+            "top_competitors": [{"name": comp[0], "count": comp[1]} for comp in competitors],
+            "common_visual_elements": [{"element": elem[0], "occurrences": elem[1]} for elem in sorted_elements[:5]]
+        }
+    except Exception as e:
+        print(f"Error getting competitor insights summary: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get competitor insights summary: {str(e)}")
+
+# Add these API endpoints
+@app.get("/competitor-ads/exemplary", tags=["Competitor Analysis"])
+async def get_exemplary_ads_endpoint(
+    category: str = None,
+    limit: int = 10, 
+    offset: int = 0
+):
+    """Get high-performing competitor ads (with effectiveness score >= 8)"""
+    return get_exemplary_competitor_ads(category, limit, offset)
+
+@app.get("/competitor-ads/insights", tags=["Competitor Analysis"])
+async def get_competitor_insights():
+    """Get aggregated insights from all analyzed competitor ads"""
+    return get_competitor_insights_summary()
+
+@app.post("/competitor-ads/batch", tags=["Competitor Analysis"])
+async def batch_upload_competitor_ads(
+    competitor_name: str = Form(...),
+    product_category: str = Form(...),
+    target_audience: str = Form(None),
+    files: List[UploadFile] = File(...)
+):
+    """Upload and analyze multiple competitor ad images at once"""
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided for upload")
+    
+    results = []
+    errors = []
+    
+    for file in files:
+        try:
+            # Validate file is an image
+            content_type = file.content_type
+            if not content_type.startswith("image/"):
+                errors.append({
+                    "filename": file.filename,
+                    "error": "File must be an image (jpeg, png, etc.)"
+                })
+                continue
+            
+            # Save and analyze the competitor ad
+            competitor_ad_id = save_competitor_ad(
+                file, competitor_name, product_category, target_audience
+            )
+            
+            # Analyze the ad
+            analysis_result = analyze_competitor_ad(competitor_ad_id)
+            results.append(analysis_result)
+            
+        except Exception as e:
+            errors.append({
+                "filename": file.filename,
+                "error": str(e)
+            })
+    
+    # Return batch results
+    return {
+        "success": len(results),
+        "errors": len(errors),
+        "results": results,
+        "error_details": errors
+    }
+
+@app.put("/competitor-ads/{competitor_ad_id}/exemplary", tags=["Competitor Analysis"])
+async def mark_ad_exemplary(competitor_ad_id: str, is_exemplary: bool = True):
+    """Manually mark or unmark an ad as exemplary"""
+    try:
+        conn = get_db_connection()
+        
+        # Check if ad exists
+        ad = conn.execute(
+            "SELECT id FROM competitor_ads WHERE id = ?",
+            (competitor_ad_id,)
+        ).fetchone()
+        
+        if not ad:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Competitor ad not found")
+        
+        # Update is_exemplary status
+        conn.execute(
+            "UPDATE competitor_ads SET is_exemplary = ? WHERE id = ?",
+            (1 if is_exemplary else 0, competitor_ad_id)
+        )
+        conn.commit()
+        conn.close()
+        
+        return {
+            "id": competitor_ad_id,
+            "is_exemplary": is_exemplary
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating exemplary status: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update exemplary status: {str(e)}")
 
 # Run the app using uvicorn when executing the script directly
 if __name__ == "__main__":

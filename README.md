@@ -1,223 +1,84 @@
-# Facebook Ad Generator API
+# AdTao Campaign
 
-A comprehensive API for generating Facebook ad content, including ad copy and images. This application uses Azure OpenAI's GPT-4o and DALL-E 3 to create compelling ad content for Facebook marketing campaigns.
+A comprehensive AI-powered advertising campaign generator that helps create integrated ad campaigns with copy, images, and audience targeting.
 
 ## Features
 
-- Generate ad copy with headline, primary text, and description
-- Generate image recommendations based on product details
-- Create images using DALL-E 3
-- Analyze uploaded product images for Facebook ad effectiveness
-- Generate captions for product images
-- Integrated ad generation (both copy and images)
-- SQLite database to store generated content
+- **Ad Copy Generation**: Create compelling ad headlines, primary text, and descriptions
+- **Image Recommendations**: Get AI-powered image style and composition recommendations
+- **Image Generation**: Generate images using DALL-E 3 based on product descriptions
+- **Image Analysis**: Analyze existing images for quality, composition, and audience appeal
+- **Caption Generation**: Generate captions and alt-text for advertising images
+- **Integrated Ad Creation**: Generate complete ads with matching copy and images
+- **Brand Profile Management**: Create and manage brand profiles to maintain consistent messaging
+- **Competitor Analysis**: Upload and analyze competitor ads for insights
 
-## Setup
+## Tech Stack
+
+- FastAPI for the backend API
+- SQLite for data storage
+- Azure OpenAI for AI capabilities (GPT-4o and DALL-E 3)
+- Pydantic for data validation
+- Pillow for image processing
+
+## Getting Started
 
 ### Prerequisites
 
-- Python 3.8 or higher
-- Azure OpenAI API access
-- Required Python packages (see below)
+- Python 3.8+
+- An Azure OpenAI API key
+
+### Environment Setup
+
+Create a `.env` file with the following variables:
+
+```
+AZURE_OPENAI_KEY=your_azure_openai_key
+AZURE_OPENAI_ENDPOINT=your_azure_openai_endpoint
+DEPLOYMENT_NAME=gpt-4o
+```
 
 ### Installation
 
-1. Clone this repository:
-   ```bash
-   git clone <repository-url>
-   cd adtao_campaign
+1. Clone the repository:
+   ```
+   git clone https://github.com/Kulraj69/adtao-campaign.git
+   cd adtao-campaign
    ```
 
-2. Install required packages:
-   ```bash
-   pip install fastapi uvicorn pillow python-dotenv openai python-multipart
+2. Install dependencies:
+   ```
+   pip install -r requirements.txt
    ```
 
-3. Create a `.env` file in the project root with your Azure OpenAI credentials:
+3. Initialize the database:
    ```
-   AZURE_OPENAI_KEY=your_azure_openai_key
-   AZURE_OPENAI_ENDPOINT=your_azure_openai_endpoint
-   DEPLOYMENT_NAME=gpt-4o
+   python -c "import main; main.init_db()"
    ```
 
-### Running the API
-
-Start the server with:
-
-```bash
-python main.py
-```
-
-This will launch the API server at `http://0.0.0.0:8000`. You can access the API documentation at `http://localhost:8000/docs`.
+4. Run the application:
+   ```
+   uvicorn main:app --reload
+   ```
 
 ## API Endpoints
 
-### Ad Copy Generation
+The application provides various endpoints organized into the following categories:
 
-#### `POST /generate-ad-copy`
+- **Ad Copy**: Generate advertising copy
+- **Images**: Generate, analyze, and caption images
+- **Integrated Ads**: Create complete ad campaigns
+- **Brand Profiles**: Manage brand guidelines and profiles
+- **Competitor Analysis**: Upload and analyze competitor ads
+- **Database**: View and manage application data
 
-Generates Facebook ad copy with headline, primary text, and description.
-
-Request body:
-```json
-{
-  "product_name": "EcoFresh Water Bottle",
-  "target_audience": "Eco-conscious fitness enthusiasts aged 25-40",
-  "key_benefits": [
-    "Made from 100% recycled materials",
-    "Keeps water cold for 24 hours",
-    "Portion of proceeds goes to ocean cleanup"
-  ],
-  "tone": "professional",
-  "ad_length": "medium"
-}
-```
-
-### Image Generation
-
-#### `POST /generate-image-recommendations`
-
-Recommends imagery for Facebook ads, including image prompts and text recommendations.
-
-Request body:
-```json
-{
-  "product_name": "EcoFresh Water Bottle",
-  "target_audience": "Eco-conscious fitness enthusiasts aged 25-40",
-  "key_benefits": [
-    "Made from 100% recycled materials",
-    "Keeps water cold for 24 hours",
-    "Portion of proceeds goes to ocean cleanup"
-  ],
-  "tone": "professional",
-  "image_style": "product photography",
-  "color_scheme": "blue and green"
-}
-```
-
-#### `POST /generate-image`
-
-Generates an image using DALL-E 3 based on a prompt.
-
-Request body:
-```json
-{
-  "prompt": "A sleek, eco-friendly water bottle made from recycled materials with a blue and green color scheme. The bottle is sitting on a beach with ocean waves in the background, highlighting its connection to ocean conservation.",
-  "size": "1024x1024"
-}
-```
-
-### Image Analysis
-
-#### `POST /analyze-image`
-
-Analyzes an uploaded product image for its effectiveness in Facebook ads.
-
-Form data:
-- `file`: Image file
-- `product_name`: Name of the product
-- `target_audience`: Target audience for the ad (optional)
-
-### Caption Generation
-
-#### `POST /generate-captions`
-
-Generates captions for a product image.
-
-Form data:
-- `file`: Image file
-- `product_name`: Name of the product
-- `tone`: Tone of the captions (default: "professional")
-
-### Integrated Ad Creation
-
-#### `POST /generate-integrated-ad`
-
-Generates both ad copy and image recommendations in a single request.
-
-Request body:
-```json
-{
-  "product_name": "EcoFresh Water Bottle",
-  "target_audience": "Eco-conscious fitness enthusiasts aged 25-40",
-  "key_benefits": [
-    "Made from 100% recycled materials",
-    "Keeps water cold for 24 hours",
-    "Portion of proceeds goes to ocean cleanup"
-  ],
-  "tone": "professional",
-  "ad_length": "medium",
-  "image_style": "product photography",
-  "color_scheme": "blue and green",
-  "generate_image": true
-}
-```
-
-### Database Endpoints
-
-#### `GET /images/recent`
-
-Retrieves recently generated images from the database.
-
-Query parameters:
-- `limit`: Maximum number of images to retrieve (default: 10)
-
-#### `GET /images/{image_id}`
-
-Retrieves details about a specific image by ID.
-
-#### `GET /ad-copies/recent`
-
-Retrieves recently generated ad copies from the database.
-
-Query parameters:
-- `limit`: Maximum number of ad copies to retrieve (default: 10)
-
-#### `GET /integrated-ads/recent`
-
-Retrieves recently generated integrated ads from the database.
-
-Query parameters:
-- `limit`: Maximum number of integrated ads to retrieve (default: 10)
-
-#### `GET /db/stats`
-
-Retrieves statistics about the database, including counts and recent items.
-
-## Database Schema
-
-The application uses SQLite to store generated content with the following tables:
-
-### Images Table
-- `id`: Unique identifier
-- `filename`: Name of the image file
-- `prompt`: Prompt used to generate the image
-- `revised_prompt`: Revised prompt used by DALL-E (if any)
-- `file_path`: Path to the image file
-- `static_path`: URL path for accessing the image
-- `creation_date`: When the image was created
-- `width`: Image width
-- `height`: Image height
-- `size`: Image size (e.g., "1024x1024")
-- `model`: Model used to generate the image (e.g., "dall-e-3")
-
-### Ad Copies Table
-- `id`: Unique identifier
-- `product_name`: Name of the product
-- `target_audience`: Target audience for the ad
-- `headline`: Generated headline
-- `primary_text`: Generated primary text
-- `description`: Generated description
-- `creation_date`: When the ad copy was created
-
-### Integrated Ads Table
-- `id`: Unique identifier
-- `ad_copy_id`: Reference to the ad copy
-- `image_id`: Reference to the image
-- `product_name`: Name of the product
-- `target_audience`: Target audience for the ad
-- `creation_date`: When the integrated ad was created
+For detailed API documentation, visit `/docs` after starting the application.
 
 ## License
 
-[MIT License](LICENSE) 
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgements
+
+- Azure OpenAI for providing the AI capabilities
+- FastAPI for the efficient API framework 
