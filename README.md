@@ -74,6 +74,20 @@ The application provides various endpoints organized into the following categori
 
 For detailed API documentation, visit `/docs` after starting the application.
 
+## Project Structure
+
+- `/static`: Contains generated images and competitor ad images for analysis
+- `/generated_images`: Stores AI-generated images for ad campaigns
+- `/uploads`: Temporary storage for uploaded images before processing
+- `/db`: Contains the SQLite database file
+
+## Latest Updates
+
+- Added competitor analysis images for enhanced ad benchmarking
+- Implemented improved image storage and organization
+- Added support for multiple competitor ad analysis
+- Enhanced database schema for better performance
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
