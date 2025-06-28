@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "adtao-campaign-api": {
+      "command": "python3",
+      "args": ["-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000"],
+      "env": {
+        "AZURE_DALLE_KEY": "your_dalle_api_key_here",
+        "AZURE_DALLE_ENDPOINT": "https://your-dalle-endpoint.openai.azure.com/",
+        "AZURE_GPT_KEY": "your_gpt_api_key_here",
+        "AZURE_GPT_ENDPOINT": "https://your-gpt-endpoint.openai.azure.com/",
+        "AZURE_SORA_KEY": "your_sora_api_key_here",
+        "AZURE_SORA_ENDPOINT": "https://your-sora-endpoint.openai.azure.com/",
+        "AZURE_TTS_KEY": "your_tts_api_key_here",
+        "SUPABASE_URL": "https://your-project-id.supabase.co",
+        "SUPABASE_ANON_KEY": "your_supabase_anon_key_here",
+        "DATABASE_URL": "postgresql://postgres:your_password@db.your-project-id.supabase.co:5432/postgres"
+      }
+    },
+    "supabase-database": {
+      "command": "python3",
+      "args": ["-m", "mcp_server_supabase"],
+      "env": {
+        "SUPABASE_URL": "https://your-project-id.supabase.co",
+        "SUPABASE_ANON_KEY": "your_supabase_anon_key_here",
+        "DATABASE_URL": "postgresql://postgres:your_password@db.your-project-id.supabase.co:5432/postgres"
+      }
+    }
+  }
+} 
