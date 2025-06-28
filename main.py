@@ -37,7 +37,7 @@ SORA_DEPLOYMENT = os.getenv("SORA_DEPLOYMENT", "sora")
 
 # Initialize DALL-E client
 dalle_client = AzureOpenAI(
-    azure_endpoint=AZURE_GPT_ENDPOINT,
+    azure_endpoint=AZURE_DALLE_ENDPOINT,
     api_key=AZURE_DALLE_KEY,
     api_version="2024-02-01"
 )
@@ -3315,7 +3315,7 @@ def generate_video_ad_prompt(request: VideoAdPromptRequest) -> VideoAdPromptResp
                         "text": """You are an expert Facebook and Instagram video advertising creative director with 15+ years of experience creating viral, high-converting social media video ads for major brands. You specialize in crafting specific, detailed video prompts optimized for Facebook and Instagram campaigns.
 
 Your video prompts should be:
-1. SOCIAL MEDIA OPTIMIZED: Hook viewers in first 3 seconds, designed for mobile viewing
+1. SOCIAL MEDIA OPTIMIZED: Hook viewers in first 3 seconds with compelling visuals
 2. PLATFORM SPECIFIC: Perfect for Facebook/Instagram feed, stories, and reels
 3. CONVERSION FOCUSED: Clear call-to-action, benefit-driven messaging
 4. TECHNICALLY PRECISE: Include camera angles, lighting, pacing for AI video generation
@@ -3323,12 +3323,13 @@ Your video prompts should be:
 
 Key Requirements:
 - Hook within first 3 seconds (use movement, contrast, or surprising visuals)
-- Mobile-first design (vertical or square aspect ratio friendly)
+- Standard video format (16:9 or 1:1 aspect ratio)
 - Clear product demonstration and benefits
 - Strong visual storytelling without relying on audio
 - Include text overlay suggestions for key messages
 - Design for 15-30 second optimal duration for social media attention spans
 - Consider platform algorithms (engagement, watch time, shares)
+- DO NOT frame the ad as being shown on a mobile device - create the actual ad content directly
 
 Always provide multiple creative alternatives optimized for different campaign objectives (awareness, consideration, conversion)."""
                     }
@@ -3356,12 +3357,13 @@ Product Information:
 SPECIFIC REQUIREMENTS FOR FACEBOOK/INSTAGRAM:
 1. Create ONE primary optimized video prompt (detailed, specific, ready for Sora)
 2. MUST include a 3-second hook that stops scrolling
-3. Design for mobile viewing (consider vertical/square formats)
+3. Use standard video format (16:9 or 1:1 aspect ratio)
 4. Include visual storytelling that works without sound
 5. Suggest text overlay placements for key messages
 6. Optimize for {suggested_duration}-second duration
 7. Include clear product demonstration and call-to-action
-8. Generate 3 alternative variations for different campaign objectives:
+8. DO NOT frame the ad as being shown on a mobile device - create the actual ad content directly
+9. Generate 3 alternative variations for different campaign objectives:
    - Version A: Brand Awareness (emotional connection)
    - Version B: Product Consideration (feature demonstration)  
    - Version C: Direct Response (urgency and conversion)
@@ -3371,7 +3373,7 @@ The primary prompt should be a detailed paragraph for AI video generation. Focus
 - Product benefits shown visually
 - Social media engagement elements
 - Clear progression from hook → demonstration → call-to-action
-- Mobile-optimized visual composition
+- Professional visual composition with high production value
 
 Make it specifically designed for Facebook/Instagram campaign success."""
                     }
@@ -3463,16 +3465,16 @@ Make it specifically designed for Facebook/Instagram campaign success."""
         # Fallback values optimized for Facebook/Instagram
         if not optimized_prompt:
             hook_element = "Quick zoom-in on product" if request.ad_style == "product demo" else "Split-screen transformation"
-            optimized_prompt = f"HOOK (0-3s): {hook_element} with bold text overlay '{request.product_name}'. DEMONSTRATION (3-12s): {request.ad_style} showcase of {request.product_name} highlighting {', '.join(request.key_benefits[:2]) if request.key_benefits else 'key benefits'} with smooth transitions and mobile-optimized framing. CALL-TO-ACTION (12-{suggested_duration}s): Product close-up with 'Shop Now' text overlay and brand logo, {request.tone} tone throughout."
+            optimized_prompt = f"HOOK (0-3s): {hook_element} with bold text overlay '{request.product_name}'. DEMONSTRATION (3-12s): {request.ad_style} showcase of {request.product_name} highlighting {', '.join(request.key_benefits[:2]) if request.key_benefits else 'key benefits'} with smooth transitions and professional framing. CALL-TO-ACTION (12-{suggested_duration}s): Product close-up with 'Shop Now' text overlay and brand logo, {request.tone} tone throughout."
         
         if not style_description:
-            style_description = f"Facebook/Instagram optimized {request.ad_style} video with {request.tone} tone. Designed for mobile viewing with strong 3-second hook, visual storytelling, and clear call-to-action. Optimized for {suggested_duration}-second social media attention span."
+            style_description = f"Facebook/Instagram optimized {request.ad_style} video with {request.tone} tone. Professional quality with strong 3-second hook, visual storytelling, and clear call-to-action. Optimized for {suggested_duration}-second social media attention span."
         
         if not technical_specs:
             technical_specs = {
-                "aspect_ratio": "1:1 or 9:16 (mobile-optimized)",
+                "aspect_ratio": "16:9 or 1:1 (standard video format)",
                 "hook_timing": "0-3 seconds with high visual impact",
-                "camera_movement": "Dynamic but smooth for mobile viewing",
+                "camera_movement": "Dynamic but smooth with professional quality",
                 "lighting": "High contrast, bright and engaging",
                 "pacing": "Fast-paced with clear visual progression",
                 "text_overlays": "Bold, readable text for key messages",
@@ -3482,9 +3484,9 @@ Make it specifically designed for Facebook/Instagram campaign success."""
         
         if not alternative_prompts:
             alternative_prompts = [
-                f"BRAND AWARENESS: Emotional lifestyle montage showing {request.target_audience} using {request.product_name} in aspirational settings, {request.tone} music and smooth transitions",
-                f"PRODUCT DEMO: Step-by-step demonstration of {request.product_name} key features with before/after comparisons and benefit callouts",
-                f"DIRECT RESPONSE: Urgent problem-solution format starting with pain point, quick product demo, customer testimonials, and strong 'Limited Time' call-to-action"
+                f"BRAND AWARENESS: Professional quality lifestyle montage showing {request.target_audience} using {request.product_name} in aspirational settings, {request.tone} music and smooth transitions",
+                f"PRODUCT DEMO: High-quality step-by-step demonstration of {request.product_name} key features with before/after comparisons and benefit callouts",
+                f"DIRECT RESPONSE: Professional urgent problem-solution format starting with pain point, quick product demo, customer testimonials, and strong 'Limited Time' call-to-action"
             ]
         
         return VideoAdPromptResponse(
